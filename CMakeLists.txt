@@ -260,6 +260,10 @@ if(TRITON_BUILD_PYTHON_MODULE)
   list(APPEND TRITON_PLUGIN_NAMES "proton")
   add_subdirectory(third_party/proton/Dialect)
 
+  # Add TLE plugin
+  list(APPEND TRITON_PLUGIN_NAMES "tle")
+  add_subdirectory(third_party/tle)
+
   if (DEFINED TRITON_PLUGIN_DIRS)
     foreach(PLUGIN_DIR ${TRITON_PLUGIN_DIRS})
       # Read the plugin name under dir/backend/name.conf
@@ -465,6 +469,8 @@ if(NOT TRITON_BUILD_PYTHON_MODULE)
     add_subdirectory(third_party/${CODEGEN_BACKEND})
   endforeach()
   add_subdirectory(third_party/proton/Dialect)
+  # flagtree tle
+  add_subdirectory(third_party/tle)
 endif()
 
 find_package(Threads REQUIRED)

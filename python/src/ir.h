@@ -3,6 +3,11 @@
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include <memory>
 
+#include <pybind11/pybind11.h>
+#include <pybind11/stl.h>
+#include <pybind11/stl_bind.h>
+namespace py = pybind11;
+
 // A custom op builder that keeps track of the last location
 class TritonOpBuilder {
 public:
@@ -98,3 +103,8 @@ private:
     return builder->getUnknownLoc();
   }
 };
+
+// flagtree tle
+namespace ir {
+extern py::class_<TritonOpBuilder> *getBuilderClass();
+} // namespace ir

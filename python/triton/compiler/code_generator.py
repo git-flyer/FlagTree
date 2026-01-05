@@ -1147,7 +1147,14 @@ class CodeGenerator(ast.NodeVisitor):
         flatten = False
         warp_specialize = False
         disable_licm = False
-        if IteratorClass is language.range:
+        # flagtree tle
+        try:
+            from ..experimental import tle
+            tle_pipeline = tle.pipeline
+        except ImportError:
+            tle_pipeline = None
+
+        if IteratorClass in [language.range, tle_pipeline]:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1332,12 +1339,22 @@ class CodeGenerator(ast.NodeVisitor):
         return next(unflatten_ir_values(handles, [callee_ret_type]))
 
     def call_Function(self, node, fn, args, kws):
+        # 4. Get current line number and hints
+        line_num = node.lineno
+        function_def = self.jit_fn.parse()
+        line_flagtree_hints = getattr(function_def.body[0], 'line_flagtree_hints', {})
+        flagtree_hints = line_flagtree_hints.get(line_num)
+
         if isinstance(fn, (BoundJITMethod, BoundConstexprFunction)):
             args.insert(0, fn.__self__)
             fn = fn.__func__
+
+        # 5. Handle JIT function calls
         if isinstance(fn, JITFunction):
             _check_fn_args(node, fn, args)
             return self.call_JitFunction(fn, args, kws)
+
+        # 6. Handle built-in functions or calls with special context
         if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn) or isinstance(
                 fn, ConstexprFunction):
             extra_kwargs = dict()
@@ -1351,6 +1368,14 @@ class CodeGenerator(ast.NodeVisitor):
             if '_generator' in sig.parameters:
                 extra_kwargs['_generator'] = self
             try:
+                # Special handling for tl.load with hints
+                if fn.__name__ == "load" and flagtree_hints is not None:
+                    print(f"tl.load at line {line_num} has annotation {flagtree_hints}")
+                    if 'flagtree_hints' not in kws:
+                        kws['flagtree_hints'] = ""
+                    if flagtree_hints not in kws['flagtree_hints']:
+                        kws['flagtree_hints'] = flagtree_hints
+
                 ret = fn(*args, **extra_kwargs, **kws)
                 # builtin functions return plain tuples for readability
                 if isinstance(ret, tuple):
@@ -1367,6 +1392,7 @@ class CodeGenerator(ast.NodeVisitor):
                 # be in core.py.
                 raise CompilationError(self.jit_fn.src, node, str(e)) from e
 
+        # 7. Handle calls from built-in namespace
         if fn in self.builtin_namespace.values() or (hasattr(fn, '__self__') and not _is_triton_value(fn.__self__)):
             args = map(_unwrap_if_constexpr, args)
         ret = fn(*args, **kws)
@@ -1386,8 +1412,10 @@ class CodeGenerator(ast.NodeVisitor):
         return self.call_Function(node, fn, args, kws)
 
     def visit_Call(self, node):
+        # 1. Get the called function object
         fn = _unwrap_if_constexpr(self.visit(node.func))
         if not isinstance(fn, BoundJITMethod):
+            # 2. Check if it's a statically implemented function
             static_implementation = self.statically_implemented_functions.get(fn)
             if static_implementation is not None:
                 return static_implementation(self, node)
@@ -1399,6 +1427,7 @@ class CodeGenerator(ast.NodeVisitor):
                 error_message.append(mur)
             raise CompilationError(self.jit_fn.src, node, " ".join(error_message))
 
+        # 3. Process keyword and positional arguments
         kws = dict(self.visit(keyword) for keyword in node.keywords)
         args = []
         for arg in node.args:
