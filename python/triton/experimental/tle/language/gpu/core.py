@@ -1,5 +1,4 @@
 # flagtree tle
-import builtins
 import triton.language.core as tl
 from typing import Optional, Sequence
 from enum import Enum
@@ -10,9 +9,6 @@ from triton.language.core import (
     tensor,
     range,
 )
-
-# Address space 3 matches the shared-memory space used in TritonGPU lowering.
-SHARED_MEMORY_ADDRESS_SPACE = 3
 
 
 class pipeline(range):
@@ -144,10 +140,9 @@ def alloc(
                 layout_handle = _semantic.builder.make_tensor_memory_encoding_attr(
                     layout.blockM,
                     layout.blockN,
-                    layout.colStride,
+                    layout.unpacked,
                     layout.CTASplitM,
                     layout.CTASplitN,
-                    layout.twoCTAs,
                 )
         else:
             # Use provided layout
@@ -248,14 +243,16 @@ def copy(
         volatile = False
 
         try:
-            if direction == CopyDirection.GM_TO_LOCAL:
+            if (direction == CopyDirection.GM_TO_LOCAL):
+                # src is global tensor
                 tt_load = _semantic.load(src, mask, other, boundary_check, padding_option, cache_modifier,
                                          eviction_policy, volatile, None)
-                local_ptrs = local_ptr(dst, _make_full_indices(dst, _semantic), _semantic=_semantic)
-                _semantic.store(local_ptrs, tt_load, mask, boundary_check, cache_modifier, eviction_policy)
+                _semantic.builder.create_local_store(dst.handle, tt_load.handle)
             else:
-                local_ptrs = local_ptr(src, _make_full_indices(src, _semantic), _semantic=_semantic)
-                load = tl.load(local_ptrs, _semantic=_semantic)
+                # src is local buffer - copy from shared memory to global memory
+                block_type = tl.block_type(src.type.element_ty, src.type.shape)
+                tt_local_load = _semantic.builder.create_local_load(block_type.to_ir(_semantic.builder), src.handle)
+                load = tl.tensor(tt_local_load, block_type)
                 _semantic.store(dst, load, mask, boundary_check, cache_modifier, eviction_policy)
         except Exception as e:
             raise RuntimeError(f"copy operation failed: {str(e)}") from e
@@ -356,133 +353,68 @@ def copy(
         return tmacopy(src, dst, direction, shape, offsets, _semantic)
 
 
-def _expand_index_to_shape(index: tl.tensor, shape: Sequence[int], axis: int, _semantic) -> tl.tensor:
-    idx = index
-    for _ in builtins.range(axis):
-        idx = tl.expand_dims(idx, 0, _semantic=_semantic)
-    for _ in builtins.range(len(shape) - axis - 1):
-        idx = tl.expand_dims(idx, len(idx.shape), _semantic=_semantic)
-    return tl.broadcast_to(idx, *shape, _semantic=_semantic)
-
-
-def _make_full_indices(buffer: tle.buffered_tensor, _semantic) -> tuple[tl.tensor, ...]:
-    shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in buffer.type.shape)
-    indices = []
-    for axis, dim in enumerate(shape):
-        idx = tl.arange(0, dim, _semantic=_semantic)
-        idx = _expand_index_to_shape(idx, shape, axis, _semantic)
-        indices.append(idx)
-    return tuple(indices)
-
-
 @tl.builtin
-def local_ptr(
+def local_load(
     buffer: tle.buffered_tensor,
-    indices: Optional[Sequence] = None,
     _semantic=None,
-    _generator=None,
 ) -> tl.tensor:
     """
-    Materialize shared-memory pointers that cover the given buffered tensor.
+    Load data from local memory buffer
 
     Args:
-        buffer: Local memory buffer tensor returned by ``tle.alloc``.
-        indices: Tuple of integer index tensors. The tuple length must equal
-            the rank of ``buffer`` and every tensor must have the same shape.
-            The output pointer tensor will have that same shape.
-        _semantic: Semantic analyzer (internal use).
-        _generator: Triton code generator (internal use).
+        buffer: Local memory buffer tensor
+        _semantic: Semantic analyzer (internal use)
 
     Returns:
-        Tensor of pointers suitable for ``tl.load``/``tl.store``.
+        Loaded data tensor
+
+    Raises:
+        ValueError: When buffer is not initialized or type mismatch
+        RuntimeError: When load operation fails
     """
+    # Parameter validation
     if not isinstance(buffer, tle.buffered_tensor):
         raise ValueError(f"Buffer parameter must be tle.buffered_tensor, but got {type(buffer)}")
 
-    # Preferred metadata source: buffered_tensor.type (survives JIT value
-    # reconstruction). Keep value attrs as backward-compatibility fallback.
-    remote_shard_id = getattr(buffer.type, "_tle_remote_shard_id", None)
-    remote_scope = getattr(buffer.type, "_tle_remote_scope", None)
-    if remote_shard_id is None:
-        remote_shard_id = getattr(buffer, "_tle_remote_shard_id", None)
-        remote_scope = getattr(buffer, "_tle_remote_scope", None)
-    remote_buffer_marker = remote_shard_id is not None
-
-    indices = tl._unwrap_if_constexpr(indices)
-    if indices is None:
-        raise ValueError("local_ptr indices must be provided as a tuple of tensors")
-    if isinstance(indices, tl.tuple):
-        indices_tuple = tuple(indices.values)
-    elif isinstance(indices, (tuple, list)):
-        indices_tuple = tuple(indices)
-    else:
-        raise ValueError("local_ptr indices must be a tuple or list of tensors")
-
-    buffer_shape = tuple(int(tl._unwrap_if_constexpr(dim)) for dim in buffer.type.shape)
-    if len(indices_tuple) != len(buffer_shape):
-        raise ValueError(f"local_ptr indices must provide {len(buffer_shape)} tensors, got {len(indices_tuple)}")
-
-    idx_tensors: list[tensor] = []
-    view_shape: Optional[tuple[int, ...]] = None
-    scalar_index_flags: list[bool] = []
-    for idx in indices_tuple:
-        idx_tensor = idx if isinstance(idx, tensor) else _semantic.to_tensor(idx)
-        if not idx_tensor.dtype.is_int():
-            raise ValueError("local_ptr indices must use integer dtypes")
-        is_scalar_index = not idx_tensor.type.is_block()
-        scalar_index_flags.append(is_scalar_index)
-        if is_scalar_index:
-            idx_tensors.append(idx_tensor)
-            continue
-        if view_shape is None:
-            view_shape = tuple(idx_tensor.shape)
-        elif tuple(idx_tensor.shape) != view_shape:
-            raise ValueError("local_ptr indices must have identical shapes")
-        idx_tensors.append(idx_tensor)
-
-    if not idx_tensors:
-        raise ValueError("local_ptr indices cannot be empty")
-    all_scalar_indices = all(scalar_index_flags)
-    any_scalar_indices = any(scalar_index_flags)
-    if any_scalar_indices and not all_scalar_indices:
-        raise ValueError("local_ptr indices must be either all scalar or all tensors with identical shapes")
-    if not all_scalar_indices and view_shape is None:
-        view_shape = tuple()
-
+    # Semantic analysis
     try:
         from .semantic import TLESemantic
         if isinstance(_semantic, TLESemantic):
-            _semantic.analyze_local_pointer_operation(buffer, idx_tensors)
+            _semantic.analyze_local_load_operation(buffer)
     except ImportError:
+        # If semantic analysis module is not available, continue with warning
         import warnings
         warnings.warn("TLE semantic analysis module not available, skipping validation", UserWarning)
 
-    ptr_dtype = tl.pointer_type(buffer.type.element_ty, SHARED_MEMORY_ADDRESS_SPACE)
-    insert_block = _semantic.builder.get_insertion_block()
-    if insert_block is None:
-        raise RuntimeError("TLE local_ptr called without an insertion block")
-    if all_scalar_indices:
-        result_ty = ptr_dtype
-        result_ir = ptr_dtype.to_ir(_semantic.builder)
-    else:
-        result_ty = tl.block_type(ptr_dtype, list(view_shape))
-        result_ir = result_ty.to_ir(_semantic.builder)
-    handles = [idx.handle for idx in idx_tensors]
-    local_ptr_op = _semantic.builder.create_local_pointers(result_ir, buffer.handle, *handles)
+    try:
+        block_type = tl.block_type(buffer.type.element_ty, buffer.type.shape)
+        output = _semantic.builder.create_local_load(block_type.to_ir(_semantic.builder), buffer.handle)
+        return tl.tensor(output, block_type)
+    except Exception as e:
+        raise RuntimeError(f"Local load operation failed: {str(e)}") from e
 
-    result_tensor = tl.tensor(local_ptr_op.get_result(0), result_ty)
 
-    if remote_buffer_marker:
-        if all_scalar_indices:
-            raise ValueError("local_ptr does not yet support scalar indices on remote buffers")
-        # Keep remote semantics attached to the source buffered tensor and
-        # materialize them only when pointer view is requested.
-        from triton.experimental.tle.language import distributed as _tle_distributed
-        result_tensor = _tle_distributed._remote_pointer(
-            result_tensor,
-            remote_shard_id,
-            scope=remote_scope,
-            _semantic=_semantic,
-        )
+@tl.builtin
+def local_store(
+    dst: tle.buffered_tensor,
+    src: tl.tensor,
+    _semantic=None,
+) -> None:
+    """
+    Store a tensor into a local memory buffer.
 
-    return result_tensor
+    Args:
+        dst: Destination buffer in local memory (shared memory or tensor memory)
+        src: Source tensor to store
+        _semantic: Semantic analyzer for validation (internal use)
+
+    Raises:
+        RuntimeError: When tensor memory storage is not yet supported
+        ValueError: When parameter types are incompatible
+    """
+    storage = dst.type.storage
+    if storage == tle.tmem:
+        raise RuntimeError("Tensor memory local_store not yet supported")
+
+    # Perform the store operation
+    _semantic.builder.create_local_store(dst.handle, src.handle)
