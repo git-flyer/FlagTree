@@ -1,9 +1,3 @@
-add_triton_library(TritonTLEAnalysis
-  AxisInfoExt.cpp
-
-  LINK_LIBS PUBLIC
-  TritonAnalysis
-  TritonGPUIR
-  TritonIR
-  TleIR
-)
+# flagtree tle
+# Analysis directory for TLE dialect
+# Add analysis-related source files here

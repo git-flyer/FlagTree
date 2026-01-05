@@ -21,9 +21,6 @@ include "mlir/IR/BuiltinAttributes.td"
 // Interfaces
 //
 def GlobalMemory : Resource<"::mlir::triton::GlobalMemory">;
-// begin flagtree tle
-def SharedMemory : Resource<"::mlir::triton::SharedMemory">;
-// end flagtree tle
 
 //
 // Op Base
@@ -252,14 +249,11 @@ def TT_LoadOp : TT_Op<"load", [
       DefaultValuedAttr<TT_CacheModifierAttr, "::mlir::triton::CacheModifier::NONE">:$cache,
       DefaultValuedAttr<TT_EvictionPolicyAttr, "::mlir::triton::EvictionPolicy::NORMAL">:$evict,
       DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
-      // begin flagtree tle
-      DefaultValuedAttr<StrAttr, "\"\"">:$flagtree_hints
-      // end flagtree tle
+      DefaultValuedAttr<StrAttr, "\"\"">:$flagtree_hints  // flagtree hints
     );
 
     let results = (outs TT_Type:$result);
 
-    // begin flagtree tle
     let builders = [
         // A tensor of pointers or a pointer to a scalar
         OpBuilder<(ins "Value":$ptr, "triton::CacheModifier":$cache,
@@ -285,7 +279,6 @@ def TT_LoadOp : TT_Op<"load", [
                        "triton::EvictionPolicy":$evict, "bool":$isVolatile,
                        CArg<"mlir::StringAttr", "{}">:$flagtree_hints)>
     ];
-    // end flagtree tle
 
     // Specify `cacheModifier` and `evictionPolicy` explicitly in the
     // assemblyFormat instead of as part of attr-dict so that they get printed
@@ -364,10 +357,8 @@ def TT_StoreOp : TT_Op<"store", [
 def TT_AtomicRMWOp : TT_Op<"atomic_rmw", [
   SameOperandsAndResultShape,
   SameOperandsAndResultEncoding,
-// begin flagtree tle
-  TypesMatchWith<"value type matches ptr type", "ptr", "val",
-                 "getPointeeType($_self)">,
-// end flagtree tle
+  TypesMatchWith<"ptr type matches value type", "val", "ptr",
+                 "getPointerTypeSameShape($_self)">,
   TypesMatchWith<"mask type matches value type",
                  "val", "mask", "getI1SameShape($_self)",
                  "($_op.getOperands().size() <= 2) || std::equal_to<>()">
@@ -382,10 +373,7 @@ def TT_AtomicRMWOp : TT_Op<"atomic_rmw", [
 
     let arguments = (ins
       TT_AtomicRMWAttr:$atomic_rmw_op,
-// begin flagtree tle
-      Arg<TT_PtrLike, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>,
-                           MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$ptr,
-// end flagtree tle
+      Arg<TT_PtrLike, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
       TT_Type:$val,
       Optional<TT_BoolLike>:$mask,
       TT_MemSemanticAttr:$sem,
@@ -405,12 +393,10 @@ def TT_AtomicRMWOp : TT_Op<"atomic_rmw", [
 def TT_AtomicCASOp : TT_Op<"atomic_cas", [
   SameOperandsAndResultShape,
   SameOperandsAndResultEncoding,
-// begin flagtree tle
-  TypesMatchWith<"cmp type matches ptr type", "ptr", "cmp",
-                  "getPointeeType($_self)">,
-  TypesMatchWith<"value type matches ptr type", "ptr", "val",
-                  "getPointeeType($_self)">
-// end flagtree tle
+  TypesMatchWith<"ptr type matches cmp type", "cmp", "ptr",
+                  "getPointerTypeSameShape($_self)">,
+  TypesMatchWith<"ptr type matches value type", "val", "ptr",
+                  "getPointerTypeSameShape($_self)">
 ]> {
     let summary = "atomic cas";
 
@@ -425,10 +411,7 @@ def TT_AtomicCASOp : TT_Op<"atomic_cas", [
     }];
 
     let arguments = (ins
-// begin flagtree tle
-      Arg<TT_PtrLike, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>,
-                           MemRead<SharedMemory>, MemWrite<SharedMemory>]>:$ptr,
-// end flagtree tle
+      Arg<TT_PtrLike, "", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
       TT_Type:$cmp,
       TT_Type:$val,
       TT_MemSemanticAttr:$sem,
@@ -688,11 +671,9 @@ def TT_DotOp : TT_Op<"dot", [Pure,
 
     let description = [{
         $d = matrix_multiply($a, $b) + $c. $inputPrecision describes how to exercise the TC
-        when the inputs are f32. It can be one of: tf32, tf32x3, ieee, bf16x3, bf16x6.
+        when the inputs are f32. It can be one of: tf32, tf32x3, ieee.
         tf32: use TC with tf32 ops.
         tf32x3: implement the 3xTF32 trick. For more info see the pass in F32DotTC.cpp
-        bf16x3: implement the 3xBF16 trick. For more info see the pass in F32DotTC.cpp
-        bf16x6: implement the 6xBF16 trick. For more info see the pass in F32DotTC.cpp
         ieee: don't use TC, implement dot in software.
         If the GPU does not have Tensor cores or the inputs are not f32, this flag is ignored.
     }];
@@ -756,7 +737,6 @@ def TT_DotScaledOp : TT_Op<"dot_scaled", [Pure,
       `lhs` `=` $a_elem_type `rhs` `=` $b_elem_type attr-dict
       `:` type($a) (`,` type($a_scale)^)? `*` type($b) (`,` type($b_scale)^)? `->` type($d)
     }];
-    let hasVerifier = 1;
 }
 
 //

@@ -1,19 +1,14 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
-#include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#ifdef __TLE__
-#include "tle/dialect/include/IR/Dialect.h"
-#endif
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
-#include "triton/Tools/LayoutUtils.h"
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONTOTRITONGPU
@@ -151,7 +146,6 @@ struct TritonExpandDimsPattern
     // return shape
     auto retShape = argType.getShape().vec();
     retShape.insert(retShape.begin() + op.getAxis(), 1);
-    auto newRank = retShape.size();
     // return encoding
     auto retSizePerThread = llvm::to_vector(argEncoding.getSizePerThread());
     retSizePerThread.insert(retSizePerThread.begin() + op.getAxis(), 1);
@@ -162,18 +156,14 @@ struct TritonExpandDimsPattern
     SmallVector<unsigned, 4> retOrder(retShape.size());
     std::iota(retOrder.begin(), retOrder.end(), 0);
 
-    auto ctaLl = argEncoding.getCTALayout().getLinearLayout();
-    auto kBlock = *ctaLl.getInDimNames().begin();
-    auto *ctx = kBlock.getContext();
-    auto newDim = standardOutDimNames(ctx, newRank)[newRank - 1];
-    ctaLl *= LinearLayout::identity1D(1, kBlock, newDim);
-    // Move last dim to op.getAxis(). nb is this a std::rotate?
-    auto newOrder = to_vector(llvm::seq<int32_t>(newRank));
-    for (int i = newRank - 1; i >= op.getAxis() + 1; --i) {
-      std::swap(newOrder[i], newOrder[i - 1]);
-    }
-    ctaLl = transposeLinearLayout(ctaLl, newOrder);
-    auto retCTALayout = CTAEncodingAttr::get(ctx, std::move(ctaLl));
+    auto argCTALayout = argEncoding.getCTALayout();
+    auto retCTAsPerCGA = insertOne(argCTALayout.getCTAsPerCGA(), op.getAxis());
+    auto retCTASplitNum =
+        insertOne(argCTALayout.getCTASplitNum(), op.getAxis());
+    auto retCTAOrder = insertOrder(argCTALayout.getCTAOrder(), op.getAxis());
+    auto retCTALayout = triton::gpu::CTALayoutAttr::get(
+        getContext(), retCTAsPerCGA, retCTASplitNum, retCTAOrder);
+
     triton::gpu::BlockedEncodingAttr retEncoding =
         triton::gpu::BlockedEncodingAttr::get(getContext(), retSizePerThread,
                                               retThreadsPerWarp, retWarpsPerCTA,
@@ -183,8 +173,8 @@ struct TritonExpandDimsPattern
         getContext(), op.getAxis(), retEncoding);
     RankedTensorType newArgType = argType.cloneWithEncoding(newArgEncoding);
     // construct new op
-    auto newSrc = triton::gpu::ConvertLayoutOp::create(
-        rewriter, op.getLoc(), newArgType, adaptor.getSrc());
+    auto newSrc = rewriter.create<triton::gpu::ConvertLayoutOp>(
+        op.getLoc(), newArgType, adaptor.getSrc());
     addNamedAttrs(rewriter.replaceOpWithNewOp<triton::ExpandDimsOp>(
                       op, newSrc, adaptor.getAxis()),
                   adaptor.getAttributes());
@@ -263,17 +253,15 @@ struct TritonDotPattern : public OpConversionPattern<triton::DotOp> {
       Attribute encoding = triton::gpu::DotOperandEncodingAttr::get(
           getContext(), 0, dEncoding, aEltType);
       auto dstType = aType.cloneWithEncoding(encoding);
-      a = triton::gpu::ConvertLayoutOp::create(rewriter, a.getLoc(), dstType,
-                                               a);
+      a = rewriter.create<triton::gpu::ConvertLayoutOp>(a.getLoc(), dstType, a);
     }
     if (!mlir::isa<triton::gpu::DotOperandEncodingAttr>(bEncoding)) {
       Attribute encoding = triton::gpu::DotOperandEncodingAttr::get(
           getContext(), 1, dEncoding, bEltType);
       auto dstType = bType.cloneWithEncoding(encoding);
-      b = triton::gpu::ConvertLayoutOp::create(rewriter, b.getLoc(), dstType,
-                                               b);
+      b = rewriter.create<triton::gpu::ConvertLayoutOp>(b.getLoc(), dstType, b);
     }
-    c = triton::gpu::ConvertLayoutOp::create(rewriter, c.getLoc(), retType, c);
+    c = rewriter.create<triton::gpu::ConvertLayoutOp>(c.getLoc(), retType, c);
 
     addNamedAttrs(rewriter.replaceOpWithNewOp<triton::DotOp>(
                       op, retType, a, b, c, adaptor.getInputPrecision(),
@@ -384,18 +372,17 @@ struct TritonSplitOpPattern : public OpConversionPattern<triton::SplitOp> {
         return res;
       };
 
-      auto layout = defaultEnc.getCTALayout().getLinearLayout();
-      auto kBlock = StringAttr::get(getContext(), "block");
-      auto newDim = standardOutDimNames(getContext(), rank)[rank - 1];
-      layout *= LinearLayout::identity1D(1, kBlock, newDim);
       srcEnc = BlockedEncodingAttr::get(
           getContext(), append(defaultEnc.getSizePerThread(), 2),
           append(defaultEnc.getThreadsPerWarp(), 1),
           append(defaultEnc.getWarpsPerCTA(), 1),
           prepend(defaultEnc.getOrder(), rank - 1),
-          CTAEncodingAttr::get(getContext(), layout));
+          CTALayoutAttr::get(getContext(),
+                             append(defaultEnc.getCTAsPerCGA(), 1),
+                             append(defaultEnc.getCTASplitNum(), 1),
+                             prepend(defaultEnc.getCTAOrder(), rank - 1)));
       srcTy = srcTy.cloneWithEncoding(srcEnc);
-      src = ConvertLayoutOp::create(rewriter, op.getLoc(), srcTy, src);
+      src = rewriter.create<ConvertLayoutOp>(op.getLoc(), srcTy, src);
     }
 
     addNamedAttrs(rewriter.replaceOpWithNewOp<triton::SplitOp>(op, src),
@@ -448,8 +435,8 @@ struct TritonReducePattern : public OpConversionPattern<triton::ReduceOp> {
   LogicalResult
   matchAndRewrite(triton::ReduceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto newReduce = triton::ReduceOp::create(
-        rewriter, op.getLoc(), adaptor.getOperands(), adaptor.getAxis());
+    auto newReduce = rewriter.create<triton::ReduceOp>(
+        op.getLoc(), adaptor.getOperands(), adaptor.getAxis());
     addNamedAttrs(newReduce, adaptor.getAttributes());
 
     auto &newCombineOp = newReduce.getCombineOp();
@@ -466,9 +453,8 @@ struct TritonScanPattern : public OpConversionPattern<triton::ScanOp> {
   LogicalResult
   matchAndRewrite(triton::ScanOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    auto newScan =
-        triton::ScanOp::create(rewriter, op.getLoc(), adaptor.getOperands(),
-                               adaptor.getAxis(), op.getReverse());
+    auto newScan = rewriter.create<triton::ScanOp>(
+        op.getLoc(), adaptor.getOperands(), adaptor.getAxis(), op.getReverse());
     addNamedAttrs(newScan, adaptor.getAttributes());
 
     auto &newCombineOp = newScan.getCombineOp();
@@ -493,8 +479,8 @@ struct TritonMapElementwisePattern
       return err;
     }
 
-    auto newMapOp = triton::MapElementwiseOp::create(
-        rewriter, op.getLoc(), resultTys, adaptor.getOperands(), op.getPack());
+    auto newMapOp = rewriter.create<triton::MapElementwiseOp>(
+        op.getLoc(), resultTys, adaptor.getOperands(), op.getPack());
     addNamedAttrs(newMapOp, adaptor.getAttributes());
 
     auto &newScalarOp = newMapOp.getScalarOp();
@@ -584,11 +570,10 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       TritonScanPattern,
       GenericOpPattern<triton::ScanReturnOp>,
       GenericOpPattern<triton::MakeRangeOp>,
-#ifdef __TLE__
+      // flagtree tle
       GenericOpPattern<triton::gpu::LocalAllocOp>,
       GenericOpPattern<triton::gpu::LocalStoreOp>,
       GenericOpPattern<triton::gpu::LocalLoadOp>,
-#endif
       TritonExpandDimsPattern,
       TritonTransPattern,
       TritonDotPattern,
@@ -721,8 +706,8 @@ public:
     if (failed(converter->convertTypes(op.getResultTypes(), newResultTypes)))
       return failure();
 
-    auto newOp = scf::WhileOp::create(rewriter, op.getLoc(), newResultTypes,
-                                      adaptor.getOperands());
+    auto newOp = rewriter.create<scf::WhileOp>(op.getLoc(), newResultTypes,
+                                               adaptor.getOperands());
     for (auto i : {0u, 1u}) {
       auto &dstRegion = newOp.getRegion(i);
       rewriter.inlineRegionBefore(op.getRegion(i), dstRegion, dstRegion.end());
@@ -802,49 +787,6 @@ void populateCFPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<CFCondBranchPattern, CFBranchPattern>(typeConverter, context);
 }
 
-#ifdef __TLE__
-class TleDSLRegionOpPattern : public OpConversionPattern<tle::DSLRegionOp> {
-public:
-  using OpConversionPattern::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(tle::DSLRegionOp op, tle::DSLRegionOp::Adaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    auto newOp = rewriter.cloneWithoutRegions<tle::DSLRegionOp>(op);
-    Region &body = op.getBody(), &newBody = newOp.getBody();
-    rewriter.inlineRegionBefore(body, newBody, newBody.end());
-
-    if (failed(rewriter.convertRegionTypes(&newBody, *getTypeConverter()))) {
-      return rewriter.notifyMatchFailure(op, "could not convert body types");
-    }
-    newOp->setOperands(adaptor.getOperands());
-    for (OpResult result : newOp->getResults()) {
-      result.setType(getTypeConverter()->convertType(result.getType()));
-    }
-
-    rewriter.replaceOp(op, newOp->getResults());
-    return success();
-  }
-};
-
-void populateTleRawPatterns(TritonGPUTypeConverter &typeConverter,
-                            RewritePatternSet &patterns) {
-  MLIRContext *context = patterns.getContext();
-  patterns
-      .add<TleDSLRegionOpPattern, GenericOpPattern<tle::LocalPointersOp>,
-           GenericOpPattern<tle::RemotePointersOp>,
-           GenericOpPattern<tle::DistributedBarrierOp>,
-           GenericOpPattern<tle::YieldOp>,
-           GenericOpPattern<tle::ExtractAllocatedPtrOp>,
-           GenericOpPattern<tle::ExtractAlignedPtrOp>,
-           GenericOpPattern<tle::ExtractOffsetOp>,
-           GenericOpPattern<tle::ExtractSizesOp>,
-           GenericOpPattern<tle::ExtractStridesOp>,
-           GenericOpPattern<tle::ExtractPtrOp>, GenericOpPattern<tle::PackOp>>(
-          typeConverter, context);
-}
-#endif
-
 class ConvertTritonToTritonGPU
     : public triton::impl::ConvertTritonToTritonGPUBase<
           ConvertTritonToTritonGPU> {
@@ -875,9 +817,6 @@ public:
     //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?
     populateSCFPatterns(typeConverter, patterns);
     populateCFPatterns(typeConverter, patterns);
-#ifdef __TLE__
-    populateTleRawPatterns(typeConverter, patterns);
-#endif
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
 
     Builder b(&getContext());

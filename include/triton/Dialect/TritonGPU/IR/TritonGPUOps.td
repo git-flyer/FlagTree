@@ -88,9 +88,6 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
     This is analogue to tt.load except the data are copied to local memory pointed
     to by the memory descriptor instead of a distributed tensor. The rest of the
     operands are the same as tt.load.
-    Contiguity is the maximum number of elements that can be loaded in a single vector with
-    the given layout and mask.
-    This allows op to use async_copy_global_to_local even if the alignment cannot be proven based on IR.
   }];
 
   let arguments = (ins
@@ -100,8 +97,7 @@ def TTG_AsyncCopyGlobalToLocalOp : TTG_Op<"async_copy_global_to_local", [
     Optional<TT_Type>:$other,
     DefaultValuedAttr<TT_CacheModifierAttr, "triton::CacheModifier::NONE">:$cache,
     DefaultValuedAttr<TT_EvictionPolicyAttr, "triton::EvictionPolicy::NORMAL">:$evict,
-    DefaultValuedAttr<BoolAttr, "false">:$isVolatile,
-    DefaultValuedAttr<I32Attr, "1">:$contiguity
+    DefaultValuedAttr<BoolAttr, "false">:$isVolatile
   );
 
   let results = (outs TTG_AsyncToken:$token);
@@ -423,14 +419,6 @@ def TTG_Fp4ToFpOp : TTG_Op<"fp4_to_fp", [Pure]> {
   let arguments = (ins RankedTensorOf<[I8]>:$src, I32Attr:$axis);
   let results = (outs TT_FloatTensor:$result);
 
-  let extraClassDeclaration = [{
-      static LogicalResult verifyFp4ToFp(
-        mlir::Operation *op,
-        RankedTensorType srcTy,
-        RankedTensorType resTy,
-        unsigned axis);
-  }];
-
   let assemblyFormat = [{
     $src attr-dict `:` type($src) `->` type($result)
   }];
@@ -578,25 +566,6 @@ def TTG_WarpReturnOp : TTG_Op<"warp_return", [
   let assemblyFormat = "attr-dict";
 }
 
-def TTG_LocalBarrierOp : TTG_Op<"local_barrier"> {
-  let summary = "Synchronizes execution and shared memory reads/writes for all threads in a CTA.";
-  let description = [{
-    The `local_barrier` op synchronizes the execution and all operations
-    between shared memory and registers for all threads in a CTA.
-    It is used to coordinate communication between the threads of the CTA.
-
-    This operation waits until all threads in the CTA have reached a `local_barrier`
-    and operations between shared memory and registers made by these threads prior
-    to the op are visible to all threads in the CTA.
-
-    Data hazards between threads accessing the same memory can be avoided by synchronizing the
-    CTA in-between these accesses with a `local_barrier`.
-
-    A `local_barrier` operation does not provide syncronization guarantees on global memory.
-  }];
-  let assemblyFormat = "attr-dict";
-}
-
 // flagtree tle
 def TTG_TMACopyOp : TTG_Op<"tma_copy", [Pure, MemoryEffects<[MemWrite]>]> {
   let summary = "self-defined tma_copy operation";
@@ -615,5 +584,4 @@ def TTG_TMACopyOp : TTG_Op<"tma_copy", [Pure, MemoryEffects<[MemWrite]>]> {
   //assemble
   let assemblyFormat = "$src `,`  $dst `,` `[` $indices `]` attr-dict `:` type($src) `,` type($dst)";
 }
-
 #endif // TRITONGPU_OPS

@@ -6,6 +6,8 @@ if(POLICY CMP0116)
   cmake_policy(SET CMP0116 OLD)
 endif()
 
+include(ExternalProject)
+
 set(CMAKE_CXX_STANDARD 17)
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
@@ -16,8 +18,6 @@ if(FLAGTREE_BACKEND)
     add_definitions(-DFLAGTREE_BACKEND=\"${FLAGTREE_BACKEND}\")
 endif()
 
-set(FLAGTREE_TLE ON)
-add_definitions(-D__TLE__)
 if(NOT FLAGTREE_BACKEND)
   add_definitions(-D__NVIDIA__)
   add_definitions(-D__AMD__)
@@ -107,6 +107,10 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE "Release")
 endif()
 
+if(NOT WIN32)
+  find_library(TERMINFO_LIBRARY tinfo)
+endif()
+
 if(TRITON_BUILD_UT)
   # This is an aggregate target for all unit tests.
   add_custom_target(TritonUnitTests)
@@ -191,10 +195,6 @@ endfunction()
 if(NOT MSVC)
   if(FLAGTREE_BACKEND)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-covered-switch-default")
-    # For enflame backend, suppress visibility warnings in gluon_ir.cc
-    if(FLAGTREE_BACKEND STREQUAL "enflame")
-      set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-attributes")
-    endif()
   else()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Werror -Wno-covered-switch-default -fvisibility=hidden")
   endif()
@@ -216,7 +216,7 @@ include_directories(${PROJECT_SOURCE_DIR}/third_party)
 include_directories(${PROJECT_BINARY_DIR}/third_party) # Tablegen'd files
 
 # link_directories(${LLVM_LIBRARY_DIR})
-if (FLAGTREE_BACKEND MATCHES "^(cambricon|aipu|tsingmicro|enflame)$")
+if (FLAGTREE_BACKEND MATCHES "^(cambricon|aipu|tsingmicro)$")
   include_directories(${PROJECT_SOURCE_DIR}/include)
   include_directories(${PROJECT_BINARY_DIR}/include) # Tablegen'd files
   add_subdirectory(include)
@@ -254,22 +254,6 @@ if(TRITON_BUILD_PYTHON_MODULE)
   link_libraries(${Python3_LIBRARIES})
   add_link_options(${Python3_LINK_OPTIONS})
 
-  foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
-    add_subdirectory(third_party/${CODEGEN_BACKEND})
-  endforeach()
-
-  if (TRITON_BUILD_PROTON)
-    add_definitions(-D__PROTON__)
-    add_subdirectory(third_party/proton)
-  endif()
-  # We always build proton dialect
-  list(APPEND TRITON_PLUGIN_NAMES "proton")
-  add_subdirectory(third_party/proton/Dialect)
-
-  # Add TLE plugin
-  list(APPEND TRITON_PLUGIN_NAMES "tle")
-  add_subdirectory(third_party/tle)
-
   if (DEFINED TRITON_PLUGIN_DIRS)
     foreach(PLUGIN_DIR ${TRITON_PLUGIN_DIRS})
       # Read the plugin name under dir/backend/name.conf
@@ -286,6 +270,22 @@ if(TRITON_BUILD_PYTHON_MODULE)
       add_subdirectory(${PLUGIN_DIR} ${PLUGIN_DIR_BUILD_OUTPUT})
     endforeach()
   endif()
+
+  foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
+    add_subdirectory(third_party/${CODEGEN_BACKEND})
+  endforeach()
+
+  if (TRITON_BUILD_PROTON)
+    add_definitions(-D__PROTON__)
+    add_subdirectory(third_party/proton)
+  endif()
+  # We always build proton dialect
+  list(APPEND TRITON_PLUGIN_NAMES "proton")
+  add_subdirectory(third_party/proton/Dialect)
+
+  # Add TLE plugin
+  list(APPEND TRITON_PLUGIN_NAMES "tle")
+  add_subdirectory(third_party/tle)
 
   get_property(triton_libs GLOBAL PROPERTY TRITON_LIBS)
   get_property(triton_plugins GLOBAL PROPERTY TRITON_PLUGINS)
@@ -420,14 +420,16 @@ if(TRITON_BUILD_PYTHON_MODULE)
 
   set(TRITON_BACKENDS_TUPLE "(${TRITON_BACKENDS_TUPLE})")
   add_compile_definitions(TRITON_BACKENDS_TUPLE=${TRITON_BACKENDS_TUPLE})
-  add_library(triton SHARED ${PYTHON_SRC_PATH}/main.cc
-                  ${PYTHON_SRC_PATH}/ir.cc
-                  ${PYTHON_SRC_PATH}/gluon_ir.cc
-                  ${PYTHON_SRC_PATH}/linear_layout.cc
-                  ${PYTHON_SRC_PATH}/passes.cc
-                  ${PYTHON_SRC_PATH}/interpreter.cc
-                  ${PYTHON_SRC_PATH}/llvm.cc
-                  ${PYTHON_SRC_PATH}/specialize.cc)
+  if(FLAGTREE_BACKEND STREQUAL "cambricon")
+    add_library(triton SHARED)
+  else()
+    add_library(triton SHARED ${PYTHON_SRC_PATH}/main.cc
+                ${PYTHON_SRC_PATH}/ir.cc
+                ${PYTHON_SRC_PATH}/gluon_ir.cc
+                ${PYTHON_SRC_PATH}/passes.cc
+                ${PYTHON_SRC_PATH}/interpreter.cc
+                ${PYTHON_SRC_PATH}/llvm.cc)
+  endif()
 
   # Link triton with its dependencies
   target_link_libraries(triton PRIVATE ${TRITON_LIBRARIES})
@@ -483,7 +485,7 @@ find_package(Threads REQUIRED)
 
 add_subdirectory(third_party/f2reduce)
 
-if(NOT FLAGTREE_BACKEND OR FLAGTREE_BACKEND MATCHES "^(aipu|tsingmicro|enflame)$")
+if(NOT FLAGTREE_BACKEND OR FLAGTREE_BACKEND MATCHES "^(aipu|tsingmicro)$")
   add_subdirectory(bin)
   add_subdirectory(test)
 endif()

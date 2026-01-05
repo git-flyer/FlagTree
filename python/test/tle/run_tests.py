@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # flagtree tle
+# Copyright (c) 2025  XCoreSigma Inc. All rights reserved.
 """
 TLE Test Runner
 
@@ -55,7 +56,7 @@ def main():
         if torch.cuda.is_available():
             integration_tests = [
                 ("integration/test_tle_pipeline_e2e.py", "TLE Pipeline End-to-End Tests"),
-                ("integration/test_tle_local_store.py", "TLE Local Pointer Integration Tests"),
+                ("integration/test_tle_local_store.py", "TLE Local Store Integration Tests"),
                 ("integration/test_tle_tma_copy.py", "TLE TMA Copy Integration Tests"),
                 ("integration/test_tle_gemm.py", "TLE TMA gemm Integration Tests"),
             ]
@@ -82,11 +83,11 @@ def main():
     print(f"{'='*60}")
 
     try:
-        import triton.experimental.tle.language as tle
+        import triton.experimental.tle as tle
         print("✅ TLE module import successful")
 
         # Test basic functionality
-        if hasattr(tle, 'gpu') and hasattr(tle.gpu, 'scope') and hasattr(tle.gpu, 'pipeline'):
+        if hasattr(tle, 'scope') and hasattr(tle, 'pipeline'):
             print("✅ Core functionality available")
         else:
             print("❌ Core functionality not available")

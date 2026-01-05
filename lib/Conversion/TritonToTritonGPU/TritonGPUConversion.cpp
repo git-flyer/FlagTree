@@ -6,10 +6,6 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
-#ifdef __TLE__
-#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
-#include "tle/dialect/include/IR/Dialect.h" // flagtree tle raw
-#endif
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -60,8 +56,7 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
   if (enableSourceRemat) {
     addSourceMaterialization([](OpBuilder &builder, RankedTensorType tensorType,
                                 ValueRange inputs, Location loc) -> Value {
-      return UnrealizedConversionCastOp::create(builder, loc, tensorType,
-                                                inputs)
+      return builder.create<UnrealizedConversionCastOp>(loc, tensorType, inputs)
           .getResult(0);
     });
   }
@@ -72,7 +67,7 @@ TritonGPUTypeConverter::TritonGPUTypeConverter(MLIRContext *context,
   addTargetMaterialization([](OpBuilder &builder, RankedTensorType tensorType,
                               ValueRange inputs, Location loc) {
     auto cast =
-        triton::gpu::ConvertLayoutOp::create(builder, loc, tensorType, inputs);
+        builder.create<triton::gpu::ConvertLayoutOp>(loc, tensorType, inputs);
     return cast.getResult();
   });
 }
@@ -89,20 +84,13 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   // Some ops from SCF are illegal
   addIllegalOp<scf::ExecuteRegionOp, scf::ParallelOp, scf::ReduceOp,
                scf::ReduceReturnOp>();
-
-#ifdef __TLE__
-  // flagtree tle raw
+  // flagtree tle
   addDynamicallyLegalOp<triton::gpu::LocalAllocOp, triton::gpu::LocalStoreOp,
                         triton::gpu::LocalLoadOp>(
       [&](Operation *op) { return isDynamicallyLegal(op, typeConverter); });
-#endif
   addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect,
                              triton::TritonDialect, cf::ControlFlowDialect,
-                             scf::SCFDialect, ub::UBDialect,
-#ifdef __TLE__
-                             LLVM::LLVMDialect // flagtree tle raw
-#endif
-                             >(
+                             scf::SCFDialect, ub::UBDialect>(
       [&](Operation *op) { return isDynamicallyLegal(op, typeConverter); });
 
   // We have requirements for the data layouts
@@ -125,18 +113,7 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     }
     return true;
   });
-
-#ifdef __TLE__
-  // flagtree tle raw
-  addDynamicallyLegalDialect<triton::tle::TleDialect>([&](Operation *op) {
-    bool hasLegalRegions = true;
-    for (auto &region : op->getRegions()) {
-      hasLegalRegions = hasLegalRegions && typeConverter.isLegal(&region);
-    }
-    return hasLegalRegions && typeConverter.isLegal(op);
-  });
 }
-#endif
 
 bool TritonGPUConversionTarget::isDynamicallyLegal(
     Operation *op, const TypeConverter &typeConverter) {
@@ -169,7 +146,7 @@ static RankedTensorType getNewIndicesType(RankedTensorType type,
   std::array<unsigned, 2> warpsPerCta = {1, numWarps};
 
   MLIRContext *ctx = type.getContext();
-  auto ctaLayout = CTAEncodingAttr::getDefault(ctx, /*rank=*/2);
+  auto ctaLayout = CTALayoutAttr::getDefault(ctx, /*rank=*/2);
   auto parentEncoding = BlockedEncodingAttr::get(
       ctx, sizePerThread, threadsPerWarp, warpsPerCta, order, ctaLayout);
   auto newEncoding = SliceEncodingAttr::get(ctx, /*dim=*/0, parentEncoding);
@@ -189,8 +166,7 @@ static LogicalResult convertGatherScatterIndices(Operation *op,
       getNewIndicesType(type, lookupThreadsPerWarp(b), lookupNumWarps(op));
   if (!newType)
     return failure();
-  Value index =
-      ConvertLayoutOp::create(b, op->getLoc(), newType, indices.get());
+  Value index = b.create<ConvertLayoutOp>(op->getLoc(), newType, indices.get());
   indices.set(index);
   return success();
 }

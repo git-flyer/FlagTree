@@ -1,10 +1,11 @@
+# Copyright (c) 2025  XCoreSigma Inc. All rights reserved.
 # flagtree tle
 """
-TLE Local Pointer Integration Tests
+TLE Local Store Integration Tests
 
-Tests TLE local pointer workflow and bidirectional copy operations:
-- Shared-memory pointer materialization (tle.gpu.local_ptr + tl.load/store)
-- Copy function bidirectional support (tle.gpu.copy)
+Tests TLE local store functionality and bidirectional copy operations:
+- Local store operations (tle.local_store)
+- Copy function bidirectional support (tle.copy)
 - Integration with Triton JIT
 - Memory allocation and data transfer validation
 """
@@ -13,7 +14,7 @@ import pytest
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language as tle
+import triton.experimental.tle as tle
 
 
 @triton.jit
@@ -53,34 +54,27 @@ def elementwise_add_kernel(
     c_ptrs = c_ptr + xstride_c * xoffs[:, None]
 
     # Allocate shared memory buffers
-    a_smem = tle.gpu.alloc([XBLOCK, YBLOCK], dtype=tl.float32, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
-    b_smem = tle.gpu.alloc([XBLOCK, YBLOCK], dtype=tl.float32, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
-    c_smem = tle.gpu.alloc([XBLOCK, YBLOCK], dtype=tl.float32, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
-    row_ids = tl.arange(0, XBLOCK)[:, None]
-    col_ids = tl.arange(0, YBLOCK)[None, :]
-    row_ids = tl.broadcast_to(row_ids, (XBLOCK, YBLOCK))
-    col_ids = tl.broadcast_to(col_ids, (XBLOCK, YBLOCK))
-    a_smem_ptrs = tle.gpu.local_ptr(a_smem, (row_ids, col_ids))
-    b_smem_ptrs = tle.gpu.local_ptr(b_smem, (row_ids, col_ids))
-    c_smem_ptrs = tle.gpu.local_ptr(c_smem, (row_ids, col_ids))
+    a_smem = tle.alloc([XBLOCK, YBLOCK], dtype=tl.float32, layout=None, scope=tle.smem)
+    b_smem = tle.alloc([XBLOCK, YBLOCK], dtype=tl.float32, layout=None, scope=tle.smem)
+    c_smem = tle.alloc([XBLOCK, YBLOCK], dtype=tl.float32, layout=None, scope=tle.smem)
 
-    # Use standard range for block-wise processing
-    for yoff in range(0, ynumel, YBLOCK):
+    # Use TLE pipeline for block-wise processing
+    for yoff in tle.pipeline(0, ynumel, YBLOCK, num_stages=2):
         # Calculate column offset for current block
         yoffs = tl.arange(0, YBLOCK) + yoff
 
         # copy data to shared memory
-        tle.gpu.copy(a_ptrs + ystride_a * yoffs[None, :], a_smem, [XBLOCK, YBLOCK])
-        tle.gpu.copy(b_ptrs + ystride_b * yoffs[None, :], b_smem, [XBLOCK, YBLOCK])
+        tle.copy(a_ptrs + ystride_a * yoffs[None, :], a_smem, [XBLOCK, YBLOCK])
+        tle.copy(b_ptrs + ystride_b * yoffs[None, :], b_smem, [XBLOCK, YBLOCK])
 
         # Load data from shared memory
-        aval = tl.load(a_smem_ptrs)
-        bval = tl.load(b_smem_ptrs)
+        aval = tle.local_load(a_smem)
+        bval = tle.local_load(b_smem)
 
         c_val = aval + bval
-        tl.store(c_smem_ptrs, c_val)
-        tle.gpu.copy(c_smem, c_ptrs + ystride_c * yoffs[None, :], [XBLOCK, YBLOCK])
-        #tle.gpu.copy(c_smem, c_ptr, shape, c_stride[x,y], [XBLOCK, YBLOCK])
+        tle.local_store(c_smem, c_val)
+        tle.copy(c_smem, c_ptrs + ystride_c * yoffs[None, :], [XBLOCK, YBLOCK])
+        #tle.copy(c_smem, c_ptr, shape, c_stride[x,y], [XBLOCK, YBLOCK])
 
 
 def elementwise_add(A, B, C, XBLOCK=32, YBLOCK=64):

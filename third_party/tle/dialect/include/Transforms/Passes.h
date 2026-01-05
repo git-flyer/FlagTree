@@ -26,7 +26,6 @@
 #define TRITON_TLE_PASSES_H
 
 #include "mlir/Pass/Pass.h"
-#include "tle/dialect/include/IR/Dialect.h"
 
 namespace mlir::triton::tle {
 
