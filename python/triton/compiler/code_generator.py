@@ -241,6 +241,11 @@ class CodeGenerator(ast.NodeVisitor):
         # special handling.
         self.visiting_arg_default_value = False
 
+        # adding unified hint manager init
+        from .hint_manager import HintManager
+        from .hint_manager import hint_get_flagtree_backend
+        self.hint_manager = HintManager(hint_get_flagtree_backend())
+
     builtin_namespace: Dict[str, Any] = {_.__name__: _ for _ in (len, list, range, float, int, isinstance, getattr)}
     builtin_namespace.update((
         ('print', language.core.device_print),
