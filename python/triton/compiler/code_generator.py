@@ -15,6 +15,7 @@ from ..runtime.jit import _normalize_ty, get_jit_fn_file_line
 from ..runtime import JITFunction
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
 from types import ModuleType
+from .hintmanager import hint_trigger
 
 
 def mangle_ty(ty):
@@ -240,11 +241,6 @@ class CodeGenerator(ast.NodeVisitor):
         # Are we currently visiting an ast.arg's default value?  These have some
         # special handling.
         self.visiting_arg_default_value = False
-
-        # adding unified hint manager init
-        from .hint_manager import HintManager
-        from .hint_manager import hint_get_flagtree_backend
-        self.hint_manager = HintManager(hint_get_flagtree_backend())
 
     builtin_namespace: Dict[str, Any] = {_.__name__: _ for _ in (len, list, range, float, int, isinstance, getattr)}
     builtin_namespace.update((
