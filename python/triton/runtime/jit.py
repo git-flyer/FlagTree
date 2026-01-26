@@ -566,8 +566,6 @@ class JITFunction(KernelInterface[T]):
 
         # parse options
         from ..compiler import make_backend
-        # tip_for_runtime_device_get
-        # torch.device = 
         device = driver.active.get_current_device()
         stream = driver.active.get_current_stream(device)
         target = driver.active.get_current_target()
@@ -754,34 +752,6 @@ class JITFunction(KernelInterface[T]):
         kernel = compile(src, None, options)
         self.cache[device][key] = kernel
         return kernel
-
-    # need to remove and place right
-    def get_flagtree_backend():
-        from triton.runtime.driver import driver
-
-        # non-driver : proton f2reduce
-        # GPUdriver : self.get_current_device = torch.cuda.current_device
-        # NPUDriver(DriverBase) : get_current_device(self) return torch.npu.current_device()
-        # AIPUDriver(DriverBase) : get_active_torch_device(self): torch.device("aipu", 0) 但是3.3的jit.run是nv的get_device方式
-        # _GCUDriver(DriverBase) : get_active_torch_device(self): torch.device("gcu", self.get_current_device())
-        # BangDriver(DriverBase) : get_device_interface(self): return torch.mlu
-        # CudaDriver(GPUDriver) : get_active_torch_device(self): return "iluvatar" !to implemet;
-        # MusaDriver(GPUDriver) : get_active_torch_device(self): return "musa" !to implemet
-        # TXDADriver(GPUDriver) : get_active_torch_device(self): return torch.device("txda", self.get_current_device())
-        # HIPDriver(GPUDriver): get_active_torch_device(self): return torch.device("cuda", self.get_current_device())
-        # CudaDriver(GPUDriver): get_active_torch_device(self): return torch.device("cuda", self.get_current_device())
-        # XPUDriver(GPUDriver): get_active_torch_device(self): return "xpu"
-        # return torch.npu.current_device() 本质貌似还是torch
-        device = driver.active.get_current_device()
-
-        # 稳定得到str
-        name = getattr(device, "name", "").lower()
-
-        # 可能不叫ascend，有可能是device编号
-        if "ascend" in name:
-            return "ascend"
-        return "default"
-
 
     # we do not parse `src` in the constructor because
     # the user might want to monkey-patch self.src dynamically.
