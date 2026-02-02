@@ -5,6 +5,7 @@ import time
 import inspect
 import hashlib
 import json
+import math
 from functools import cached_property
 from typing import Dict, Tuple, List, Optional
 
@@ -32,6 +33,8 @@ class Autotuner(KernelInterface):
             self.configs = [Config({}, num_warps=4, num_stages=3, num_ctas=1)]
         else:
             self.configs = configs
+        if self.configs and (len(self.configs) > 0):
+            self.shared_config_pre_hook = self.configs[0].pre_hook
         self.keys = key
         self.cache: Dict[Tuple, Config] = {}
         self.arg_names = arg_names
@@ -130,9 +133,15 @@ class Autotuner(KernelInterface):
             tensor_size = self.nargs[tensor_size_name]
             block_size = current[block_size_name]
             if block_size > tensor_size:
+                if knobs.autotuning.ajust_block_size_print:
+                    print(f'[INFO] Load Adjust block size: {block_size_name}={block_size} > tensor_size={tensor_size}')
                 block_size = tensor_size
+                power = math.ceil(math.log2(block_size))
+                block_size = 2 ** power
                 self.adjusted_block_names.add(block_size_name)
             if block_size_name == "BLOCK_K" and block_size < 16:
+                if knobs.autotuning.ajust_block_size_print:
+                    print(f'[INFO] Load Adjust block size: {block_size_name}={block_size} < 16')
                 block_size = 16
                 self.adjusted_block_names.add(block_size_name)
             current[block_size_name] = block_size
@@ -144,10 +153,11 @@ class Autotuner(KernelInterface):
         for tensor_name in tensor_names:
             tensor = self.nargs[tensor_name]
             block_size = current[block_size_name]
-
             elem_type_size = tensor.element_size()
             if int(elem_type_size * block_size) < 16 and \
                block_size_name in self.adjusted_block_names:
+                if knobs.autotuning.ajust_block_size_print:
+                    print(f'[INFO] TMA make desc Adjust block size: {block_size_name}({block_size}) * {elem_type_size} < 16')
                 block_size = int(16 / elem_type_size)
 
         if block_size:
@@ -170,9 +180,13 @@ class Autotuner(KernelInterface):
                 for tensor_size, block_size_name in zip(base.shape, block_size_names):
                     block_size = current[block_size_name]
                     if block_size > tensor_size:
+                        if knobs.autotuning.ajust_block_size_print:
+                            print(f'[INFO] TMA load Adjust block size: {block_size_name}={block_size} > tensor_size={tensor_size}')
                         block_size = tensor_size
                         self.adjusted_block_names.add(block_size_name)
                     if block_size_name == "BLOCK_K" and block_size < 16:
+                        if knobs.autotuning.ajust_block_size_print:
+                            print(f'[INFO] Load Adjust block size: {block_size_name}={block_size} < 16')
                         block_size = 16
                         self.adjusted_block_names.add(block_size_name)
                     current[block_size_name] = block_size
@@ -184,6 +198,8 @@ class Autotuner(KernelInterface):
                     block_size = current[last_block_dim_name]
                     if int(elem_type_size * block_size) < 16 and \
                         last_block_dim_name in self.adjusted_block_names:
+                        if knobs.autotuning.ajust_block_size_print:
+                            print(f'[INFO] TMA Load Adjust block size: {block_size_name}({block_size}) * {elem_type_size} < 16')
                         block_size = int(16 / elem_type_size)
                     current[last_block_dim_name] = block_size
                     config.kwargs[last_block_dim_name] = block_size
@@ -255,7 +271,10 @@ class Autotuner(KernelInterface):
         # augment meta-parameters with tunable ones
         current = dict(meta, **config.all_kwargs())
         # flagtree tune: 自动从依赖分析结果中获取参数配对
-        self._auto_adjust_block_sizes(current, config)
+        if knobs.autotuning.adjust_block_size:
+            self._auto_adjust_block_sizes(current, config)
+        if knobs.autotuning.ajust_block_size_print:
+            print(f'[INFO] Adjusted Config: {config}')
         full_nargs = {**self.nargs, **current}
 
         def kernel_call():
@@ -386,6 +405,7 @@ class Autotuner(KernelInterface):
         # FIXME: use deepcopy to prevent modification of the original configs
         import copy
         pruned_configs = copy.deepcopy(self.configs)
+        # pruned_configs = self.configs
         if self.early_config_prune:
             pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)
         if self.perf_model:
