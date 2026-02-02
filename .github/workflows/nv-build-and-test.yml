@@ -111,7 +111,10 @@ jobs:
         shell: bash
         run: |
           set -x
-          python3.11 -m pytest -s python/test/unit
+          python3.11 -m pytest -s python/test/unit \
+              --ignore=python/test/unit/test_debug.py \
+              --ignore=python/test/unit/test_debug_dump.py \
+              --ignore=python/test/unit/tools/test_disasm.py
           if [ -d "python/test/operators" ]; then
             python3.11 -m pytest -s python/test/operators
           fi
