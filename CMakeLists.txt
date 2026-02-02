@@ -410,7 +410,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
   elseif(FLAGTREE_BACKEND STREQUAL "ascend")
     set(PYTHON_ROOT_SRC_PATH ${CMAKE_CURRENT_SOURCE_DIR}/python/src)
     include_directories(${PYTHON_ROOT_SRC_PATH})
-    add_library(triton SHARED ${PYTHON_ROOT_SRC_PATH}/main.cc
+    add_library(triton SHARED ${PYTHON_SRC_PATH}/main.cc
                 ${PYTHON_SRC_PATH}/ir.cc
                 ${PYTHON_ROOT_SRC_PATH}/passes.cc
                 ${PYTHON_ROOT_SRC_PATH}/interpreter.cc

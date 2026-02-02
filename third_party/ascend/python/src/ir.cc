@@ -1,27 +1,3 @@
-/*
- * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
- * Copyright 2018-2020 Philippe Tillet
- * Copyright 2020-2022 OpenAI
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
-
 #include <optional>
 #include <pybind11/functional.h>
 #include <pybind11/pybind11.h>
@@ -33,12 +9,12 @@
 #include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/MLIRContext.h"
-#include "mlir/IR/ValueRange.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/Pass/Pass.h"
@@ -56,99 +32,97 @@
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/Support/SourceMgr.h"
 
+#include "ir.h"
 namespace {
 
 namespace py = pybind11;
 using namespace mlir;
 using namespace triton;
 
+// FIXME:modify community
 // A custom op builder that keeps track of the last location
-class TritonOpBuilder {
-public:
-  TritonOpBuilder(MLIRContext *context,
-                  const std::string &compile_mode = "simd") {
-    builder = std::make_unique<OpBuilder>(context);
-    lastLoc = std::make_unique<Location>(builder->getUnknownLoc());
-    this->compile_mode = compile_mode;
-  }
+// class TritonOpBuilder {
+// public:
+//   TritonOpBuilder(MLIRContext *context) {
+//     builder = std::make_unique<OpBuilder>(context);
+//     lastLoc = std::make_unique<Location>(builder->getUnknownLoc());
+//   }
 
-  OpBuilder &getBuilder() { return *builder; }
+//   OpBuilder &getBuilder() { return *builder; }
 
-  bool isLineInfoEnabled() { return lineInfoEnabled; }
+//   bool isLineInfoEnabled() { return lineInfoEnabled; }
 
-  bool isSimtMode() const { return compile_mode == "simt"; }
+//   void setLastLoc(Location loc) {
+//     if (lineInfoEnabled)
+//       lastLoc = std::make_unique<Location>(loc);
+//   }
 
-  void setLastLoc(Location loc) {
-    if (lineInfoEnabled)
-      lastLoc = std::make_unique<Location>(loc);
-  }
+//   void setLastLoc(const std::string &fileName, int line, int column) {
+//     auto context = builder->getContext();
+//     setLastLoc(FileLineColLoc::get(context, fileName, line, column));
+//   }
 
-  void setLastLoc(const std::string &fileName, int line, int column) {
-    auto context = builder->getContext();
-    setLastLoc(FileLineColLoc::get(context, fileName, line, column));
-  }
+//   Location getLastLoc() {
+//     assert(lastLoc);
+//     return *lastLoc;
+//   }
 
-  Location getLastLoc() {
-    assert(lastLoc);
-    return *lastLoc;
-  }
+//   void setInsertionPointToStart(Block &block) {
+//     if (!block.empty())
+//       setLastLoc(block.begin()->getLoc());
+//     else
+//       setLastLoc(builder->getUnknownLoc());
+//     builder->setInsertionPointToStart(&block);
+//   }
 
-  void setInsertionPointToStart(Block &block) {
-    if (!block.empty())
-      setLastLoc(block.begin()->getLoc());
-    else
-      setLastLoc(builder->getUnknownLoc());
-    builder->setInsertionPointToStart(&block);
-  }
+//   void setInsertionPointToEnd(Block &block) {
+//     if (!block.empty())
+//       setLastLoc(block.back().getLoc());
+//     else
+//       setLastLoc(builder->getUnknownLoc());
+//     builder->setInsertionPointToEnd(&block);
+//   }
 
-  void setInsertionPointToEnd(Block &block) {
-    if (!block.empty())
-      setLastLoc(block.back().getLoc());
-    else
-      setLastLoc(builder->getUnknownLoc());
-    builder->setInsertionPointToEnd(&block);
-  }
+//   void setInsertionPointAfter(Operation &op) {
+//     setLastLoc(op.getLoc());
+//     builder->setInsertionPointAfter(&op);
+//   }
 
-  void setInsertionPointAfter(Operation &op) {
-    setLastLoc(op.getLoc());
-    builder->setInsertionPointAfter(&op);
-  }
+//   void restoreInsertionPoint(OpBuilder::InsertPoint pt) {
+//     if (pt.isSet() && pt.getPoint() != pt.getBlock()->end())
+//       setLastLoc(pt.getPoint()->getLoc());
+//     else
+//       setLastLoc(builder->getUnknownLoc());
+//     builder->restoreInsertionPoint(pt);
+//   }
 
-  void restoreInsertionPoint(OpBuilder::InsertPoint pt) {
-    if (pt.isSet() && pt.getPoint() != pt.getBlock()->end())
-      setLastLoc(pt.getPoint()->getLoc());
-    else
-      setLastLoc(builder->getUnknownLoc());
-    builder->restoreInsertionPoint(pt);
-  }
+//   template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
+//     auto loc = getLastLoc();
+//     return builder->create<OpTy>(loc, std::forward<Args>(args)...);
+//   }
 
-  template <typename OpTy, typename... Args> OpTy create(Args &&...args) {
-    auto loc = getLastLoc();
-    return builder->create<OpTy>(loc, std::forward<Args>(args)...);
-  }
+//   // Overload to create or fold a single result operation.
+//   template <typename OpTy, typename... Args>
+//   std::enable_if_t<OpTy::template hasTrait<OpTrait::OneResult>(), Value>
+//   createOrFold(Args &&...args) {
+//     auto loc = getLastLoc();
+//     return builder->createOrFold<OpTy>(loc, std::forward<Args>(args)...);
+//   }
 
-  // Overload to create or fold a single result operation.
-  template <typename OpTy, typename... Args>
-  std::enable_if_t<OpTy::template hasTrait<OpTrait::OneResult>(), Value>
-  createOrFold(Args &&...args) {
-    auto loc = getLastLoc();
-    return builder->createOrFold<OpTy>(loc, std::forward<Args>(args)...);
-  }
+//   // Overload to create or fold a zero result operation.
+//   template <typename OpTy, typename... Args>
+//   std::enable_if_t<OpTy::template hasTrait<OpTrait::ZeroResults>(), OpTy>
+//   createOrFold(Args &&...args) {
+//     auto loc = getLastLoc();
+//     return builder->createOrFold<OpTy>(loc, std::forward<Args>(args)...);
+//   }
 
-  // Overload to create or fold a zero result operation.
-  template <typename OpTy, typename... Args>
-  std::enable_if_t<OpTy::template hasTrait<OpTrait::ZeroResults>(), OpTy>
-  createOrFold(Args &&...args) {
-    auto loc = getLastLoc();
-    return builder->createOrFold<OpTy>(loc, std::forward<Args>(args)...);
-  }
-
-private:
-  std::unique_ptr<OpBuilder> builder;
-  std::unique_ptr<Location> lastLoc;
-  bool lineInfoEnabled = !triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO");
-  std::string compile_mode;
-};
+// private:
+//   std::unique_ptr<OpBuilder> builder;
+//   std::unique_ptr<Location> lastLoc;
+//   bool lineInfoEnabled =
+//   !triton::tools::getBoolEnv("TRITON_DISABLE_LINE_INFO");
+// };
 
 std::string locationToString(Location loc) {
   std::string str;
@@ -170,6 +144,15 @@ void outputWarning(Location loc, const std::string &msg) {
 /*****************************************************************************/
 /* Python bindings for ir                                                    */
 /*****************************************************************************/
+
+namespace ir {
+
+// Pointer to the TritonOpBuilder class, used to register IR ops for third-party
+// dialects.
+static py::class_<TritonOpBuilder> *builderClassPtr = nullptr;
+py::class_<TritonOpBuilder> *getBuilderClass() { return builderClassPtr; }
+
+} // namespace ir
 
 void init_triton_ir(py::module &&m) {
   using ret = py::return_value_policy;
@@ -617,8 +600,10 @@ void init_triton_ir(py::module &&m) {
 
   py::class_<OpBuilder::InsertPoint>(m, "InsertPoint", py::module_local());
 
-  py::class_<TritonOpBuilder>(m, "builder", py::module_local(),
-                              py::dynamic_attr())
+  static py::class_<TritonOpBuilder> builderClass(
+      m, "builder", py::module_local(), py::dynamic_attr());
+  ir::builderClassPtr = &builderClass;
+  builderClass
       .def(py::init<MLIRContext *, const std::string &>(), py::arg("context"),
            py::arg("compile_mode") = "simd",
            "Create a TritonOpBuilder with optional compile_mode (simt or simd, "
@@ -745,6 +730,16 @@ void init_triton_ir(py::module &&m) {
              return self.create<arith::ConstantOp>(
                  self.getBuilder().getF64FloatAttr(v));
            })
+      .def("get_fp8e4nv",
+           [](TritonOpBuilder &self, double v) -> Value {
+             return self.create<arith::ConstantOp>(
+                 FloatAttr::get(self.getBuilder().getFloat8E4M3FNType(), v));
+           })
+      .def("get_fp8e5",
+           [](TritonOpBuilder &self, double v) -> Value {
+             return self.create<arith::ConstantOp>(
+                 FloatAttr::get(self.getBuilder().getFloat8E5M2Type(), v));
+           })
       .def("get_null_value",
            [](TritonOpBuilder &self, Type type) -> Value {
              if (auto floatTy = dyn_cast<FloatType>(type))
@@ -833,6 +828,21 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Type &elementType,
               std::vector<int64_t> &shape) -> Type {
              return RankedTensorType::get(shape, elementType);
+           })
+      .def("get_buffer_ty",
+           [](TritonOpBuilder &self, std::vector<int64_t> &shape,
+              Type &elementType, const Attribute &memorySpace) -> Type {
+             return MemRefType::get(shape, elementType,
+                                    MemRefLayoutAttrInterface{}, memorySpace);
+           })
+      .def("get_buffer_ty_with_strides",
+           [](TritonOpBuilder &self, std::vector<int64_t> &shape,
+              Type &elementType, const std::vector<int64_t> &strides,
+              const Attribute &memorySpace) -> Type {
+             // create a layout with strides, using dynamic offset
+             auto layout = StridedLayoutAttr::get(
+                 self.getBuilder().getContext(), ShapedType::kDynamic, strides);
+             return MemRefType::get(shape, elementType, layout, memorySpace);
            })
       .def("get_function_ty",
            [](TritonOpBuilder &self, std::vector<Type> inTypes,
@@ -1331,6 +1341,14 @@ void init_triton_ir(py::module &&m) {
               std::vector<Value> &indices) -> void {
              self.create<DescriptorStoreOp>(desc, value, indices);
            })
+      // Make a tensor descriptor
+      .def("create_make_tensor_descriptor",
+           [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
+              std::vector<Value> &strides, std::vector<int32_t> &tensorShape,
+              bool isSignedInteger) -> Value {
+             return self.create<MakeTensorDescOp>(base, shape, strides,
+                                                  tensorShape, isSignedInteger);
+           })
       .def("create_tensormap_create",
            [](TritonOpBuilder &self, Value desc_ptr, Value global_address,
               std::vector<Value> box_dim, std::vector<Value> global_dim,
@@ -1386,90 +1404,6 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &a) -> std::vector<Value> {
              auto op = self.create<SplitOp>(a);
              return std::vector<Value>(op->result_begin(), op->result_end());
-           })
-      .def("create_extract_scalar",
-           [](TritonOpBuilder &self, Value &src,
-              std::vector<Value> &indices) -> Value {
-             llvm::SmallVector<Value> arg_indices;
-             for (const auto &i : indices) {
-               auto iTy = i.getType();
-               if (!iTy.isIndex()) {
-                 auto v = self.create<arith::IndexCastOp>(
-                     self.getBuilder().getIndexType(), i);
-                 arg_indices.push_back(v);
-               } else {
-                 arg_indices.push_back(i);
-               }
-             }
-             auto ret = self.create<tensor::ExtractOp>(src, arg_indices);
-             return ret;
-           })
-      .def("create_extract_slice",
-           [](TritonOpBuilder &self, Value &ful, std::vector<Value> &offs_vec,
-              std::vector<int> &sizs_vec, std::vector<int> &strd_vec) -> Value {
-             llvm::SmallVector<Value> offsets;
-             for (const auto &o : offs_vec) {
-               auto oTy = o.getType();
-               if (!oTy.isIndex()) {
-                 auto v = self.create<arith::IndexCastOp>(
-                     self.getBuilder().getIndexType(), o);
-                 offsets.push_back(v);
-               } else {
-                 offsets.push_back(o);
-               }
-             }
-             llvm::SmallVector<Value> sizes;
-             llvm::SmallVector<int64_t> retSizes;
-             for (const auto &s : sizs_vec) {
-               auto v = self.create<arith::ConstantIndexOp>(s);
-               sizes.push_back(v);
-               retSizes.push_back(s);
-             }
-             llvm::SmallVector<Value> strides;
-             for (const auto &s : strd_vec) {
-               auto v = self.create<arith::ConstantIndexOp>(s);
-               strides.push_back(v);
-             }
-             auto retTy = RankedTensorType::get(
-                 retSizes,
-                 cast<RankedTensorType>(ful.getType()).getElementType());
-
-             return self.create<tensor::ExtractSliceOp>(retTy, ful, offsets,
-                                                        sizes, strides);
-           })
-      .def("create_insert_slice",
-           [](TritonOpBuilder &self, Value &ful, Value &sub,
-              std::vector<Value> &offs_vec, std::vector<int> &sizs_vec,
-              std::vector<int> &strd_vec) -> Value {
-             llvm::SmallVector<Value> offsets;
-             for (const auto &o : offs_vec) {
-               auto oTy = o.getType();
-               if (!oTy.isIndex()) {
-                 auto v = self.create<arith::IndexCastOp>(
-                     self.getBuilder().getIndexType(), o);
-                 offsets.push_back(v);
-               } else {
-                 offsets.push_back(o);
-               }
-             }
-             llvm::SmallVector<Value> sizes;
-             llvm::SmallVector<int64_t> retSizes;
-             for (const auto &s : sizs_vec) {
-               auto v = self.create<arith::ConstantIndexOp>(s);
-               sizes.push_back(v);
-               retSizes.push_back(s);
-             }
-             llvm::SmallVector<Value> strides;
-             for (const auto &s : strd_vec) {
-               auto v = self.create<arith::ConstantIndexOp>(s);
-               strides.push_back(v);
-             }
-             auto retTy = RankedTensorType::get(
-                 retSizes,
-                 cast<RankedTensorType>(ful.getType()).getElementType());
-             auto ret = self.create<tensor::InsertSliceOp>(sub, ful, offsets,
-                                                           sizes, strides);
-             return ret;
            })
       // Implements tl.trans and tl.permute.
       .def("create_trans",
@@ -1608,10 +1542,6 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::ErfOp>(val);
            })
-      .def("create_tanh",
-           [](TritonOpBuilder &self, Value &val) -> Value {
-             return self.create<math::TanhOp>(val);
-           })
       .def("create_sqrt",
            [](TritonOpBuilder &self, Value &val) -> Value {
              return self.create<math::SqrtOp>(val);
@@ -1725,218 +1655,6 @@ void init_triton_ir(py::module &&m) {
            [](TritonOpBuilder &self, Value &ptr,
               std::vector<Value> &offsets) -> Value {
              return self.create<AdvanceOp>(ptr.getType(), ptr, offsets);
-           })
-      // Add custom op
-      .def("create_custom_op_for_inter_core_sync",
-           [](TritonOpBuilder &self, std::string &op_name,
-              std::string &mode_or_sender, int id) -> void {
-             auto args = self.getBuilder().getArrayAttr(
-                 {self.getBuilder().getStringAttr(mode_or_sender),
-                  self.getBuilder().getI32IntegerAttr(id)});
-             self.create<CustomOp>(op_name, args, ValueRange());
-           })
-      // Make a tensor descriptor
-      .def("create_make_tensor_descriptor",
-           [](TritonOpBuilder &self, Value &base, std::vector<Value> &shape,
-              std::vector<Value> &strides, std::vector<int32_t> &tensorShape,
-              bool isSignedInteger) -> Value {
-             return self.create<MakeTensorDescOp>(base, shape, strides,
-                                                  tensorShape, isSignedInteger);
-           })
-      // Index select SIMD operation
-      .def("create_index_select_simd",
-           [](TritonOpBuilder &self, Value &src, Value &index, int32_t dim,
-              std::vector<Value> &srcShape, std::vector<Value> &srcOffset,
-              std::vector<int32_t> &readShape,
-              std::vector<int32_t> &returnShape) -> Value {
-             auto &builder = self.getBuilder();
-             auto loc = self.getLastLoc();
-
-             // Get element type from source pointer
-             Type elemType;
-             if (auto ptrTy = dyn_cast<triton::PointerType>(src.getType())) {
-               elemType = ptrTy.getPointeeType();
-             } else {
-               llvm::report_fatal_error(
-                   "index_select_simd: src must be pointer type");
-             }
-
-             // Create return tensor type
-             llvm::SmallVector<int64_t> retShape;
-             for (const auto &s : returnShape) {
-               retShape.push_back(s);
-             }
-             auto retTensorType = RankedTensorType::get(retShape, elemType);
-
-             // Convert srcShape and srcOffset values to index type if needed
-             llvm::SmallVector<Value> srcShapeIndex;
-             for (auto val : srcShape) {
-               if (!val.getType().isIndex()) {
-                 val = self.create<arith::IndexCastOp>(builder.getIndexType(),
-                                                       val);
-               }
-               srcShapeIndex.push_back(val);
-             }
-
-             llvm::SmallVector<Value> srcOffsetIndex;
-             for (auto val : srcOffset) {
-               if (!val.getType().isIndex()) {
-                 val = self.create<arith::IndexCastOp>(builder.getIndexType(),
-                                                       val);
-               }
-               srcOffsetIndex.push_back(val);
-             }
-
-             // Create attributes
-             auto dimAttr = builder.getI32IntegerAttr(dim);
-             auto readShapeAttr = builder.getDenseI32ArrayAttr(readShape);
-
-             // Create the IndexSelectSimdOp
-             // Parameter order must match TritonOps.td definition:
-             // src, index, dim, src_shape, src_offset, read_shape
-             auto indexSelectSimdOp = builder.create<triton::IndexSelectSimdOp>(
-                 loc,
-                 retTensorType,  // result type
-                 src,            // src pointer
-                 index,          // index tensor
-                 dimAttr,        // dim attribute
-                 srcShapeIndex,  // src_shape (variadic, index type)
-                 srcOffsetIndex, // src_offset (variadic, index type)
-                 readShapeAttr   // read_shape attribute
-             );
-
-             return indexSelectSimdOp.getResult();
-           })
-      // Add an annotation
-      .def("create_annotation",
-           [](TritonOpBuilder &self, Value &ptr, const std::string &attrKey,
-              Attribute &attrVal) {
-             auto annotationOp = self.create<AnnotationOp>(ptr);
-             annotationOp->setAttr(self.getBuilder().getStringAttr(attrKey),
-                                   attrVal);
-           })
-      .def("create_embedding_gather",
-           [](TritonOpBuilder &self, Value &src, Value &idx,
-              const int64_t bound, const int64_t blksiz,
-              std::vector<Value> &offsets,
-              std::vector<Value> &numels) -> Value {
-             auto elemTy = cast<PointerType>(src.getType()).getPointeeType();
-             auto idxTy = cast<RankedTensorType>(idx.getType());
-             auto idxShape = idxTy.getShape();
-             std::vector<int64_t> retShape(idxShape.begin(), idxShape.end());
-             retShape.push_back(blksiz);
-             auto resType = RankedTensorType::get(retShape, elemTy);
-             auto idxBitWidth = idxTy.getElementType().getIntOrFloatBitWidth();
-             auto bound_val =
-                 self.create<arith::ConstantIntOp>(bound, idxBitWidth);
-             auto blksiz_val =
-                 self.create<arith::ConstantIntOp>(blksiz, idxBitWidth);
-
-             return self.create<EmbeddingGatherOp>(resType, src, idx, bound_val,
-                                                   blksiz_val, offsets, numels);
-           })
-      .def("create_index_put",
-           [](TritonOpBuilder &self, Value &ptr, Value &index, Value &value,
-              const int32_t dim, const int64_t indexBoundary,
-              std::vector<Value> &endOffset, std::vector<Value> &startOffset,
-              std::vector<Value> &dstStride) -> void {
-             // dim need to be i32 type
-             auto dimI32Ty = self.getBuilder().getI32Type();
-             auto dim_val = self.create<arith::ConstantIntOp>(dim, dimI32Ty);
-             // indexBoundary need to be i64 type
-             auto BoundI64Ty = self.getBuilder().getI64Type();
-             auto bound_val =
-                 self.create<arith::ConstantIntOp>(indexBoundary, BoundI64Ty);
-
-             self.create<IndexPutOp>(ptr, index, value, dim_val, bound_val,
-                                     endOffset, startOffset, dstStride);
-           })
-      .def("create_gather_out_to_ub",
-           [](TritonOpBuilder &self, Value &src, Value &index,
-              const int64_t indexBoundary, const int32_t dim,
-              std::vector<Value> &srcStride, std::vector<Value> &endOffset,
-              std::vector<Value> &startOffset,
-              std::optional<Value> &other) -> Value {
-             auto elemTy = cast<PointerType>(src.getType()).getPointeeType();
-             auto idxTy = cast<RankedTensorType>(index.getType());
-             auto idxShape = idxTy.getShape();
-             std::vector<int64_t> retShape(idxShape.begin(), idxShape.end());
-             auto resType = RankedTensorType::get(retShape, elemTy);
-
-             // indexBoundary need to be i64 type
-             auto BoundI64Ty = self.getBuilder().getI64Type();
-             auto bound_val =
-                 self.create<arith::ConstantIntOp>(indexBoundary, BoundI64Ty);
-             // dim need to be i32 type
-             auto dimI32Ty = self.getBuilder().getI32Type();
-             auto dim_val = self.create<arith::ConstantIntOp>(dim, dimI32Ty);
-             return self.create<GatherOutToUbOp>(
-                 resType, src, index, bound_val, dim_val, srcStride, endOffset,
-                 startOffset, other.value_or(Value()));
-           })
-      .def("create_scatter_ub_to_out",
-           [](TritonOpBuilder &self, Value &ptr, Value &value, Value &index,
-              const int64_t indexBoundary, const int32_t dim,
-              std::vector<Value> &dstStride, std::vector<Value> &endOffset,
-              std::vector<Value> &startOffset) -> void {
-             auto idxTy = cast<RankedTensorType>(index.getType());
-
-             // indexBoundary need to be i64 type
-             auto BoundI64Ty = self.getBuilder().getI64Type();
-             auto bound_val =
-                 self.create<arith::ConstantIntOp>(indexBoundary, BoundI64Ty);
-             // dim need to be i32 type
-             auto dimI32Ty = self.getBuilder().getI32Type();
-             auto dim_val = self.create<arith::ConstantIntOp>(dim, dimI32Ty);
-
-             self.create<ScatterUbToOutOp>(ptr, value, index, bound_val,
-                                           dim_val, dstStride, endOffset,
-                                           startOffset);
-           })
-      // Add mod
-      .def("create_mod",
-           [](TritonOpBuilder &self, Value &lhs, Value &rhs) -> Value {
-             auto type = dyn_cast<RankedTensorType>(lhs.getType());
-             if (!type) {
-               type = RankedTensorType::get({1}, lhs.getType());
-               auto tensorFromLhs =
-                   self.create<tensor::FromElementsOp>(type, lhs);
-               auto tensorFromRhs =
-                   self.create<tensor::FromElementsOp>(type, rhs);
-               auto resultTensor = self.create<triton::ModOp>(
-                   type, tensorFromLhs, tensorFromRhs);
-               SmallVector<Value> indices{
-                   self.create<arith::ConstantIndexOp>(0)};
-               return self.create<tensor::ExtractOp>(resultTensor, indices);
-             }
-             return self.create<triton::ModOp>(type, lhs, rhs);
-           })
-      // Add sort
-      .def("create_sort",
-           [](TritonOpBuilder &self, Value src, int64_t dim,
-              bool descending) -> Value {
-             auto &builder = self.getBuilder();
-             auto loc = self.getLastLoc();
-
-             auto dimAttr = builder.getI64IntegerAttr(dim);
-             auto descendingAttr = builder.getBoolAttr(descending);
-
-             auto op = builder.create<triton::SortOp>(loc, src, dimAttr,
-                                                      descendingAttr);
-
-             return op->getResult(0);
-           })
-      // Add flip
-      .def("create_flip",
-           [](TritonOpBuilder &self, Value src, int64_t dim) -> Value {
-             auto &builder = self.getBuilder();
-             auto loc = self.getLastLoc();
-
-             auto dimAttr = builder.getI64IntegerAttr(dim);
-
-             auto op = builder.create<triton::FlipOp>(loc, src, dimAttr);
-
-             return op->getResult(0);
            });
 
   py::class_<PassManager>(m, "pass_manager", py::module_local())
