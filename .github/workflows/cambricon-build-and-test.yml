@@ -8,4 +8,4 @@ on:
 
 jobs:
   cambricon-build-and-test:
-    uses: flagos-ai/flagtree/.github/workflows/cambricon-build-and-test.yml@main
+    uses: flagos-ai/flagtree/.github/workflows/cambricon-build-and-test.yml@workflow_unifiy

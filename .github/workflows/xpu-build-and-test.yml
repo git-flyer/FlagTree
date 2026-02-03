@@ -9,4 +9,4 @@ on:
 
 jobs:
   xpu-build-and-test:
-    uses: flagos-ai/flagtree/.github/workflows/xpu-build-and-test.yml@main
+    uses: flagos-ai/flagtree/.github/workflows/xpu-build-and-test.yml@workflow_unifiy

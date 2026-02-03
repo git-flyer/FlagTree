@@ -8,4 +8,4 @@ on:
 
 jobs:
   tsingmicro-build-and-test:
-    uses: flagos-ai/flagtree/.github/workflows/tsingmicro-build-and-test.yml@main
+    uses: flagos-ai/flagtree/.github/workflows/tsingmicro-build-and-test.yml@workflow_unifiy

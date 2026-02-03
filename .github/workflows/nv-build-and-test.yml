@@ -10,4 +10,4 @@ on:
 
 jobs:
   nv-build-and-test:
-    uses: flagos-ai/flagtree/.github/workflows/nv-build-and-test.yml@main
+    uses: flagos-ai/flagtree/.github/workflows/nv-build-and-test.yml@workflow_unifiy
