@@ -439,6 +439,7 @@ class TXDABackend(BaseBackend):
 
     @staticmethod
     def make_ttir(mod, metadata, opt):
+        # TODO: just test ci
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
         passes.common.add_inliner(pm)
