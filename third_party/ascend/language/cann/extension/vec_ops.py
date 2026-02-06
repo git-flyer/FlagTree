@@ -533,11 +533,3 @@ def cast(input, dtype: dtype, fp_downcast_rounding: Optional[str] = None, bitcas
         else:
             raise ValueError(f"Unknown overflow_mode:{overflow_mode} is found.")
     return ret
-
-
-tl.insert_slice = insert_slice
-tl.extract_slice = extract_slice
-tl.get_element = get_element
-tl.flip = flip
-tl.sort = sort
-tl.cast = cast

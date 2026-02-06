@@ -48,3 +48,21 @@ libdevice.fma = math.fma
 libdevice.abs = math.abs
 
 __all__ = ["libdevice", "extension"]
+
+
+def _bind_extension_symbols_to_tl():
+    import triton.language as tl
+
+    names = getattr(extension, "__all__", None)
+    if not names:
+        return
+
+    for name in names:
+        if not hasattr(extension, name):
+            continue
+        if hasattr(tl, name):
+            continue
+        setattr(tl, name, getattr(extension, name))
+
+
+_bind_extension_symbols_to_tl()
