@@ -260,9 +260,9 @@ __all__ = [
 ]
 
 # flagtree backend specialization
-from triton.runtime.driver import spec
+#from triton.runtime.driver import spec
 
-__all__ = spec("language_modify_all", __all__) or __all__
+#__all__ = spec("language_modify_all", __all__) or __all__
 
 
 def str_to_ty(name):

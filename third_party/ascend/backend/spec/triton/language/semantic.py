@@ -4,11 +4,11 @@ import warnings
 from typing import List, Optional, Sequence, Tuple, TypeVar
 import numbers
 
-from .._C.libtriton import ir
+from triton._C.libtriton import ir
 from . import core as tl
 from . import math
 
-from . import is_compile_on_910_95
+from triton.language import is_compile_on_910_95
 
 T = TypeVar('T')
 

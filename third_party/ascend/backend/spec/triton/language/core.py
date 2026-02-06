@@ -7,11 +7,11 @@ from functools import partial, wraps
 import typing
 from typing import Union, Callable, List, Sequence, TypeVar, Optional
 import builtins
-from ..runtime.jit import jit
+from triton.runtime.jit import jit
 import inspect
 import os
 
-from .._C.libtriton import ir
+from triton._C.libtriton import ir
 from . import semantic
 from ._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape, get_primitive_bitwidth
 

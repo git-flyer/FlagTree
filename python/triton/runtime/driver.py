@@ -93,10 +93,12 @@ def spec_path(path_list: list):
         return
     current_path = path_list[0]
     current_path = current_path.replace(os.sep, "/")
-    marker = "python/triton"
+    marker = "/triton/"
     idx = current_path.find(marker)
-    if idx != -1:
-        rel_path = current_path[idx:]
-        backend_path = os.path.join("third_party/ascend/backend/spec", rel_path)
-        if os.path.isdir(backend_path):
-            path_list.insert(0, backend_path)
+    if idx == -1:
+        return
+    triton_root = current_path[:idx + len("/triton") - 1]  # e.g., ".../triton"
+    rel_path = current_path[idx + len(marker):]  # e.g., "language" or "runtime"
+    backend_path = os.path.join(triton_root, "backends", "ascend", "spec", "triton", rel_path)
+    if os.path.isdir(backend_path):
+        path_list.insert(0, backend_path)

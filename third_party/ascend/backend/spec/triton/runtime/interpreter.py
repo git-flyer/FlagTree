@@ -9,10 +9,10 @@ import numpy as np
 import triton
 import triton.language as tl
 from dataclasses import dataclass
-from .errors import InterpreterError
+from triton.runtime.errors import InterpreterError
 from functools import partial
-from .._C.libtriton import interpreter as _interpreter
-from .._C.libtriton import ir as _ir
+from triton._C.libtriton import interpreter as _interpreter
+from triton._C.libtriton import ir as _ir
 
 
 class TensorHandle:
