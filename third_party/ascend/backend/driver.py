@@ -154,12 +154,16 @@ class NPULauncher(object):
 class NPUDriver(DriverBase):
 
     def __init__(self):
-        self.utils = NPUUtils()
+        # self.utils = NPUUtils()
         self.launcher_cls = NPULauncher
         # flagtree backend specialization
         from triton.backends.ascend import spec
         self.spec = spec
         super().__init__()
+
+    @property
+    def utils(self):
+        return NPUUtils()
 
     @classmethod
     def is_active(cls):

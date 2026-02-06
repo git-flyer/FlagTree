@@ -562,3 +562,6 @@ def interleave(a, b):
         # understand that if we take the `if` above we definitely don't run this
         # `else`.
         return core.reshape(c, c.shape[:-2] + [2 * c.shape[-2]])
+
+
+tl.topk = topk

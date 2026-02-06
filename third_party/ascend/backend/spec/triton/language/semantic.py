@@ -2036,3 +2036,9 @@ def make_tensor_descriptor(base: tl.tensor, shape: List[tl.tensor], strides: Lis
     handle = builder.create_make_tensor_descriptor(base_handle, [s.handle for s in shape], [s.handle for s in strides],
                                                    block_shape, is_signed_int)
     return tl.tensor_descriptor(handle, shape, strides, desc_block_type)
+
+
+tl.make_tensor_descriptor = make_tensor_descriptor
+tl.load_tensor_descriptor = load_tensor_descriptor
+tl.store_tensor_descriptor = store_tensor_descriptor
+tl.gather = gather
