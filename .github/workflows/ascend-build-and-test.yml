@@ -102,20 +102,5 @@ jobs:
               --ignore=test_softmax_mindspore.py \
               --ignore=test_assume.py \
               --ignore=test_custom.py \
-              --ignore=test_dot_scaled.py \
-              --ignore=test_elementwise_ceil.py \
-              --ignore=test_elementwise_clip.py \
-              --ignore=test_elementwise_f2i.py \
-              --ignore=test_elementwise_floor.py \
-              --ignore=test_elementwise_i2f.py \
-              --ignore=test_elementwise_round.py \
-              --ignore=test_custom.py \
-              --ignore=test_custom.py \
-              --ignore=test_custom.py \
-              --ignore=test_custom.py \
-              #--ignore=test_index_select.py \
-              #--ignore=test_linearize_permute.py \
-              #--ignore=test_logical_and.py \
-              #--ignore=test_logical_or.py \
-              #--ignore=test_triton_unified_attention.py
+              --ignore=test_index_select.py
           popd

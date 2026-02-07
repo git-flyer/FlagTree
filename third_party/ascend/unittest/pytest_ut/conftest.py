@@ -30,6 +30,7 @@ def assign_npu(request, worker_id):
         backend = "torch_npu"
     if backend == "torch_npu":
         import torch
+        import torch_npu
         npu_count = torch.npu.device_count()
         if worker_id == "master":
             npu_id = 0
