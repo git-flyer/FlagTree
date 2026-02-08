@@ -84,6 +84,7 @@ jobs:
           python3 02-fused-softmax.py
           python3 03-layer-norm.py
           python3 04-fused-attention.py
+          python3 05-matrix-multiplication.py
           python3 06-demo-autotune.py
           python3 07-profiler.py
           python3 08-demo-libentry.py

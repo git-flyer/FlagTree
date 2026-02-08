@@ -186,7 +186,7 @@ def matmul(a, b, activation=""):
 # ---------
 #
 # We can test our custom matrix multiplication operation against a native torch implementation (i.e., cuBLAS).
-torch.npu.set_device(1)
+# torch.npu.set_device(1)
 torch.manual_seed(0)
 a = torch.randn((512, 512), device=DEV, dtype=torch.float16)
 b = torch.randn((512, 512), device=DEV, dtype=torch.float16)
