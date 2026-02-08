@@ -101,6 +101,5 @@ jobs:
               --ignore=test_add_mindspore.py \
               --ignore=test_softmax_mindspore.py \
               --ignore=test_assume.py \
-              --ignore=test_custom.py \
               --ignore=test_index_select.py
           popd
