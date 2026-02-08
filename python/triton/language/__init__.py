@@ -1,14 +1,11 @@
-# TODO
-try:
-    import acl
-    is_compile_on_910_95 = acl.get_soc_name().startswith("Ascend910_95")
-except Exception:
-    is_compile_on_910_95 = False
+from triton.runtime.driver import spec_path, spec
 
 # flagtree backend path specialization
-from triton.runtime.driver import spec_path
-
 spec_path(__path__)
+
+# flagtree backend specialization
+spec("language_extend_globals", globals())
+
 """isort:skip_file"""
 # Import order is significant here.
 
@@ -267,10 +264,6 @@ __all__ = [
 ]
 
 # flagtree backend specialization
-from triton.runtime.driver import spec
-
-__all__ = spec("language_modify_all", __all__) or __all__
-
 spec("language_extend_exports", globals(), __all__)
 
 

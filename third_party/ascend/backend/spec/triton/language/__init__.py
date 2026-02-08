@@ -1,9 +1,10 @@
-def language_modify_all(all_array):
+def language_extend_globals(globals_dict):
     try:
         import acl
         is_compile_on_910_95 = acl.get_soc_name().startswith("Ascend910_95")
     except Exception as e:
         is_compile_on_910_95 = False
+    globals_dict["is_compile_on_910_95"] = is_compile_on_910_95
 
 
 def language_extend_exports(globals_dict, all_list):
