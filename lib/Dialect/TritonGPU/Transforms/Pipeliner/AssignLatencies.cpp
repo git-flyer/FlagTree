@@ -1,7 +1,5 @@
 #include "triton/Analysis/AxisInfo.h"
-#ifdef __TLE__
 #include "triton/Dialect/Triton/IR/Types.h"
-#endif
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/MMAv5PipelineUtility.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -105,7 +103,6 @@ public:
                          tt::ModuleAxisInfoAnalysis &axisInfoAnalysis,
                          bool filterSmall) {
     if (auto loadOp = dyn_cast<tt::LoadOp>(op)) {
-#ifdef __TLE__
       auto ptrTy = loadOp.getPtr().getType();
       if (auto tensorTy = dyn_cast<RankedTensorType>(ptrTy))
         ptrTy = tensorTy.getElementType();
@@ -114,7 +111,6 @@ public:
         // Shared-memory loads should not be pipelined into async global copies.
         return false;
       }
-#endif
       if (filterSmall && !canBeConvertedToAsyncLoad(loadOp, axisInfoAnalysis)) {
         LDBG("Load " << *loadOp << " is too small for pipelining");
         return false;
@@ -207,7 +203,7 @@ public:
           // overlap. WS does not have this problem because the MMA is placed in
           // a different partition than the MMA, so we can correctly set the
           // latency.
-          if (isWarpSpecialized(forOp)) {
+          if (forOp->hasAttr(kWarpSpecializeAttrName)) {
             if (ttng::hasAccReadModifyWrite(mma, forOp))
               opLatency.erase(&op); // can't pipeline the MMA
             else
@@ -230,17 +226,6 @@ private:
     }
     return false;
   }
-
-  bool isWarpSpecialized(scf::ForOp forOp) {
-    scf::ForOp current = forOp;
-    do {
-      if (current->hasAttr(kWarpSpecializeAttrName)) {
-        return true;
-      }
-      current = current->getParentOfType<scf::ForOp>();
-    } while (current);
-    return false;
-  };
 };
 
 // Discover operations that should become async and assign latencies to them

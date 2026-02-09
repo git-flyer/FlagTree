@@ -9,6 +9,7 @@
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LayoutUtility.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "llvm/Support/raw_ostream.h"
@@ -18,25 +19,6 @@ namespace {
 using namespace mlir;
 namespace ttg = mlir::triton::gpu;
 namespace tle = mlir::triton::tle;
-constexpr llvm::StringLiteral kRemoteShardCarrierAttr =
-    "tle.remote_shard_id_carrier";
-constexpr llvm::StringLiteral kTTContiguityAttr = "tt.contiguity";
-constexpr llvm::StringLiteral kTTDivisibilityAttr = "tt.divisibility";
-constexpr llvm::StringLiteral kTTConstancyAttr = "tt.constancy";
-
-void copyAxisInfoAttrs(Operation *src, Operation *dst) {
-  if (!src || !dst)
-    return;
-  auto tryCopy = [&](StringRef name) {
-    if (dst->getDiscardableAttr(name))
-      return;
-    if (auto attr = src->getDiscardableAttr(name))
-      dst->setDiscardableAttr(name, attr);
-  };
-  tryCopy(kTTContiguityAttr);
-  tryCopy(kTTDivisibilityAttr);
-  tryCopy(kTTConstancyAttr);
-}
 
 struct LocalPointersOpConversion
     : public ConvertOpToLLVMPattern<tle::LocalPointersOp> {
@@ -58,14 +40,8 @@ struct LocalPointersOpConversion
     };
 
     auto memDescTy = cast<ttg::MemDescType>(op.getSrc().getType());
-    auto resultTensorTy = dyn_cast<RankedTensorType>(op.getResult().getType());
-    auto resultPtrTy = dyn_cast<triton::PointerType>(op.getResult().getType());
-    if (!resultTensorTy && !resultPtrTy)
-      return reportFailure("local_pointers result must be tensor<ptr> or ptr");
-    auto ptrTy =
-        resultTensorTy
-            ? cast<triton::PointerType>(resultTensorTy.getElementType())
-            : resultPtrTy;
+    auto resultTy = cast<RankedTensorType>(op.getResult().getType());
+    auto ptrTy = cast<triton::PointerType>(resultTy.getElementType());
     auto llvmElemTy = typeConverter->convertType(memDescTy.getElementType());
     auto llvmPtrTy =
         cast<LLVM::LLVMPointerType>(typeConverter->convertType(ptrTy));
@@ -88,29 +64,21 @@ struct LocalPointersOpConversion
     auto sharedEnc = cast<ttg::SharedEncodingTrait>(memDescTy.getEncoding());
     auto kReg = str_attr("register");
     auto kOffset = str_attr("offset");
-    LinearLayout regLayout;
-    if (resultTensorTy) {
-      if (!resultTensorTy.getEncoding())
-        return reportFailure(
-            "tensor local_pointers result must carry an encoding");
-      regLayout = ttg::toLinearLayout(resultTensorTy);
-    }
+    if (!resultTy.getEncoding())
+      return reportFailure("local_pointers result must carry an encoding");
+
+    LinearLayout regLayout = ttg::toLinearLayout(resultTy);
     for (Value operand : op.getIndices()) {
-      if (resultTensorTy) {
-        auto idxTy = dyn_cast<RankedTensorType>(operand.getType());
-        if (!idxTy)
-          return reportFailure("tensor result requires ranked-tensor indices");
-        if (resultTensorTy.getEncoding() && idxTy.getEncoding() &&
-            resultTensorTy.getEncoding() != idxTy.getEncoding())
-          return reportFailure(
-              "indices tensor encoding must match result encoding");
-      } else if (!isa<IntegerType>(operand.getType())) {
-        return reportFailure("scalar result requires scalar integer indices");
-      }
+      auto idxTy = dyn_cast<RankedTensorType>(operand.getType());
+      if (!idxTy)
+        return reportFailure("indices must be ranked tensors");
+      if (resultTy.getEncoding() && idxTy.getEncoding() &&
+          resultTy.getEncoding() != idxTy.getEncoding())
+        return reportFailure(
+            "indices tensor encoding must match result encoding");
     }
 
-    const size_t outSize = resultTensorTy ? regLayout.getInDimSize(kReg) : 1;
-    SmallVector<Value> outVals(outSize, Value());
+    SmallVector<Value> outVals(regLayout.getInDimSize(kReg), Value());
 
     TritonLLVMOpBuilder b(loc, rewriter);
     int elemBits = llvmElemTy.getIntOrFloatBitWidth();
@@ -136,18 +104,11 @@ struct LocalPointersOpConversion
     SmallVector<SmallVector<Value>> indexElems;
     indexElems.reserve(indexVals.size());
     for (Value indexVal : indexVals) {
-      if (resultTensorTy) {
-        auto elems = unpackLLElements(loc, indexVal, rewriter);
-        if (elems.size() != outVals.size())
-          return reportFailure(
-              "indices tensors must match local_pointers result shape");
-        indexElems.push_back(std::move(elems));
-      } else {
-        Value scalar = ensureI32(indexVal);
-        if (!scalar)
-          return reportFailure("scalar indices must lower to i32 values");
-        indexElems.push_back(SmallVector<Value>{scalar});
-      }
+      auto elems = unpackLLElements(loc, indexVal, rewriter);
+      if (elems.size() != outVals.size())
+        return reportFailure(
+            "indices tensors must match local_pointers result shape");
+      indexElems.push_back(std::move(elems));
     }
 
     for (size_t idx = 0; idx < outVals.size(); ++idx) {
@@ -197,46 +158,14 @@ struct LocalPointersOpConversion
       outVals[idx] = b.bitcast(advanced, llvmPtrTy);
     }
 
-    if (resultTensorTy) {
-      Value result =
-          packLLElements(loc, typeConverter, outVals, rewriter, resultTensorTy);
-      rewriter.replaceOp(op, result);
-    } else {
-      rewriter.replaceOp(op, outVals.front());
-    }
+    Value result =
+        packLLElements(loc, typeConverter, outVals, rewriter, resultTy);
+    rewriter.replaceOp(op, result);
     return success();
   }
 
 private:
   const TargetInfoBase &targetInfo;
-};
-
-struct RemotePointersOpConversion
-    : public OpConversionPattern<tle::RemotePointersOp> {
-  using OpConversionPattern<tle::RemotePointersOp>::OpConversionPattern;
-
-  LogicalResult
-  matchAndRewrite(tle::RemotePointersOp op, OpAdaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const override {
-    Value offset = op.getShardId();
-    if (auto srcTy = dyn_cast<RankedTensorType>(op.getSrc().getType())) {
-      auto shardTy = dyn_cast<RankedTensorType>(offset.getType());
-      if (!shardTy || shardTy.getShape() != srcTy.getShape() ||
-          shardTy.getEncoding() != srcTy.getEncoding()) {
-        auto offsetTy = RankedTensorType::get(
-            srcTy.getShape(), offset.getType(), srcTy.getEncoding());
-        offset =
-            rewriter.create<triton::SplatOp>(op.getLoc(), offsetTy, offset);
-      }
-    }
-    auto addPtr = rewriter.create<triton::AddPtrOp>(op.getLoc(), op.getType(),
-                                                    op.getSrc(), offset);
-    addPtr->setAttr(kRemoteShardCarrierAttr, rewriter.getUnitAttr());
-    copyAxisInfoAttrs(op.getOperation(), addPtr.getOperation());
-    copyAxisInfoAttrs(op.getSrc().getDefiningOp(), addPtr.getOperation());
-    rewriter.replaceOp(op, addPtr.getResult());
-    return success();
-  }
 };
 
 } // namespace
@@ -245,6 +174,4 @@ void tle::populateLocalPointersOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<LocalPointersOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<RemotePointersOpConversion>(typeConverter, patterns.getContext(),
-                                           benefit);
 }

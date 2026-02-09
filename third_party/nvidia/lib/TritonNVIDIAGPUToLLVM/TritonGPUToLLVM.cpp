@@ -10,24 +10,22 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Arith/Transforms/Passes.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
-#ifdef __TLE__
+// begin flagtree tle
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
-#endif
+// end flagtree tle
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/Dialect/Math/IR/Math.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#ifdef __TLE__
-#include "tle/dialect/include/Analysis/AxisInfoExt.h"
 #include "tle/dialect/include/Conversion/TleToLLVM/DSLRegionOpToLLVM.h"
-#include "tle/dialect/include/Conversion/TleToLLVM/DistributedBarrierOpToLLVM.h"
 #include "tle/dialect/include/Conversion/TleToLLVM/ExtractOpToLLVM.h"
+// begin flagtree tle
 #include "tle/dialect/include/Conversion/TleToLLVM/LocalPointersOpToLLVM.h"
+// end flagtree tle
 #include "tle/dialect/include/Conversion/TleToLLVM/PackOpToLLVM.h"
 #include "tle/dialect/include/IR/Dialect.h"
-#endif
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Analysis/Membar.h"
@@ -85,16 +83,20 @@ public:
   }
 };
 
-#ifdef __TLE__
+// flagtree tle raw
 class TleLLVMConversionTarget : public ConversionTarget {
 public:
   explicit TleLLVMConversionTarget(MLIRContext &ctx,
                                    LLVMTypeConverter &typeConverter)
       : ConversionTarget(ctx) {
+    // begin flagtree tle
     addLegalDialect<arith::ArithDialect, LLVM::LLVMDialect, math::MathDialect,
                     NVVM::NVVMDialect, mlir::gpu::GPUDialect>();
+    // end flagtree tle
     addIllegalDialect<tle::TleDialect>();
+    // begin flagtree tle
     addLegalOp<mlir::UnrealizedConversionCastOp>();
+    // end flagtree tle
     addDynamicallyLegalOp<tle::DSLRegionOp, tle::YieldOp>(
         [&](Operation *op) -> bool {
           bool hasLegalRegions = true;
@@ -107,7 +109,6 @@ public:
     markUnknownOpDynamicallyLegal([](Operation *) -> bool { return true; });
   }
 };
-#endif
 
 struct ConvertTritonGPUToLLVM
     : public triton::impl::ConvertTritonGPUToLLVMBase<ConvertTritonGPUToLLVM> {
@@ -147,15 +148,11 @@ struct ConvertTritonGPUToLLVM
     // because the call op has to know the shared memory base address of each
     // function
     initSharedMemory(typeConverter);
-#ifdef __TLE__
-    mlir::triton::tle::ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
-#else
     ModuleAxisInfoAnalysis axisInfoAnalysis(mod);
-#endif
 
     RewritePatternSet patterns(context);
     int benefit = patternBenefitPrioritizeOverLLVMConversions;
-#ifdef __TLE__
+    // flagtree tle raw
     {
       TleLLVMConversionTarget target(*context, typeConverter);
       RewritePatternSet patterns(context);
@@ -165,15 +162,14 @@ struct ConvertTritonGPUToLLVM
                                                          patterns, benefit);
       mlir::triton::tle::populatePackOpToLLVMPatterns(typeConverter, patterns,
                                                       benefit);
-      mlir::triton::tle::populateDistributedBarrierOpToLLVMPatterns(
-          typeConverter, patterns, benefit);
+      // begin flagtree tle
       mlir::triton::tle::populateLocalPointersOpToLLVMPatterns(
           typeConverter, targetInfo, patterns, benefit);
+      // end flagtree tle
       if (failed(applyPartialConversion(mod, target, std::move(patterns)))) {
         return signalPassFailure();
       }
     }
-#endif
     mlir::triton::NVIDIA::populateConvertLayoutOpToLLVMPatterns(
         typeConverter, targetInfo, patterns, benefit);
     mlir::triton::NVIDIA::populateTensorMemorySubviewOpToLLVMPattern(
@@ -279,11 +275,11 @@ private:
     // Ask for 16B alignment on global_smem because that's the largest we should
     // ever need (4xi32).
     auto arrayTy = LLVM::LLVMArrayType::get(elemTy, 0);
-    LLVM::GlobalOp::create(
-        b, loc, arrayTy, /*isConstant=*/false, LLVM::Linkage::External,
+    b.create<LLVM::GlobalOp>(
+        loc, arrayTy, /*isConstant=*/false, LLVM::Linkage::External,
         "global_smem", /*value=*/Attribute(), /*alignment=*/16,
         // Add ROCm support.
-        static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared));
+        static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedMemorySpace));
   }
 };
 

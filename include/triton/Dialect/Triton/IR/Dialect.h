@@ -27,11 +27,11 @@ namespace triton {
 struct GlobalMemory : public SideEffects::Resource::Base<GlobalMemory> {
   StringRef getName() final { return "<GlobalMemory>"; }
 };
-#ifdef __TLE__
+// begin flagtree tle
 struct SharedMemory : public SideEffects::Resource::Base<SharedMemory> {
   StringRef getName() final { return "<SharedMemory>"; }
 };
-#endif
+// end flagtree tle
 
 class DialectInferLayoutInterface
     : public DialectInterface::Base<DialectInferLayoutInterface> {
