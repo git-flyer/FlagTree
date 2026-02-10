@@ -149,7 +149,7 @@ struct ConvertTritonGPUToLLVM
                                                          patterns, benefit);
       mlir::triton::tle::populatePackOpToLLVMPatterns(typeConverter, patterns,
                                                       benefit);
-      mlir::triton::tle::populateExtractTileOpToLLVMPatterns(  // 🆕 添加这行
+      mlir::triton::tle::populateExtractTileOpToLLVMPatterns(
       typeConverter, patterns, benefit
   );
       if (failed(applyPartialConversion(mod, target, std::move(patterns)))) {
