@@ -20,22 +20,24 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_TO_HIVM_CONVERSION_PASSES_H
-#define TRITON_TO_HIVM_CONVERSION_PASSES_H
+#ifndef TRITON_ADAPTER_TRITON_TO_HIVM_CONVERSION_PASSES_H
+#define TRITON_ADAPTER_TRITON_TO_HIVM_CONVERSION_PASSES_H
 
 #include "mlir/Pass/Pass.h"
-// #include "ascend/include/TritonToHIVM/TritonToHIVM.h"
 
 namespace mlir {
+// Forward declarations.
 class ModuleOp;
+
 namespace triton {
 
 /// Creates a pass to convert Triton dialect to HIVM dialect.
 std::unique_ptr<OperationPass<ModuleOp>> createTritonToHIVMPass();
+
 #define GEN_PASS_REGISTRATION
 #include "ascend/include/TritonToHIVM/Passes.h.inc"
 
 } // namespace triton
 } // namespace mlir
 
-#endif // TRITON_TO_HIVM_CONVERSION_PASSES_H
+#endif // TRITON_ADAPTER_TRITON_TO_HIVM_CONVERSION_PASSES_H
