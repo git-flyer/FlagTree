@@ -95,6 +95,7 @@ class TLESemantic:
         if not isinstance(buffer, tle.buffered_tensor):
             raise TLESemanticError(f"Buffer must be tle.buffered_tensor, but got {type(buffer)}", "local_load")
 
+
     def analyze_alloc_operation(self, shape: Sequence[Union[int, any]], dtype: tl.dtype,
                                 layout: Optional[tle.shared_layout], storage: tle.scope) -> Tuple[List[int], tl.dtype]:
         """Analyze alloc operation semantics"""
@@ -110,3 +111,109 @@ class TLESemantic:
     def analyze_local_load_operation(self, buffer: tle.buffered_tensor) -> None:
         """Analyze local_load operation semantics"""
         self.validate_local_load_buffer(buffer)
+
+    def validate_extract_tile_params(
+        self, 
+        src: tl.tensor, 
+        offsets: Sequence[int], 
+        tile_shape: Sequence[int]
+    ) -> None:
+        """
+        Validate extract_tile parameters.
+    
+        Checks:
+            1. src is tl.tensor
+            2. offsets and tile_shape are non-empty
+            3. All values are integers
+            4. Dimensions match
+            5. Offsets are non-negative
+            6. Tile fits within source bounds
+        """
+        # ✅ 检查1: src类型
+        if not isinstance(src, tl.tensor):
+            raise TLESemanticError(
+                f"Source must be tl.tensor, but got {type(src)}", 
+                "extract_tile"
+            )
+    
+        # ✅ 检查2: 非空
+        if not offsets or not tile_shape:
+            raise TLESemanticError(
+                "Offsets and tile_shape cannot be empty", 
+                "extract_tile"
+            )
+    
+        # ✅ 检查3: 解包并验证类型
+        offsets_unwrapped = [
+            o.value if hasattr(o, 'value') else o 
+            for o in offsets
+        ]
+        tile_shape_unwrapped = [
+            s.value if hasattr(s, 'value') else s 
+            for s in tile_shape
+        ]
+    
+        if any(not isinstance(o, int) for o in offsets_unwrapped):
+            raise TLESemanticError(
+                "All offsets must be int or constexpr", 
+                "extract_tile"
+            )
+    
+        if any(not isinstance(s, int) for s in tile_shape_unwrapped):
+            raise TLESemanticError(
+                "All tile_shape dims must be int or constexpr", 
+                "extract_tile"
+            )
+    
+        # ✅ 检查4: 正数
+        if any(s <= 0 for s in tile_shape_unwrapped):
+            raise TLESemanticError(
+                "All tile_shape dims must be positive", 
+                "extract_tile"
+            )
+    
+        # ✅ 检查5: 非负
+        if any(o < 0 for o in offsets_unwrapped):
+            raise TLESemanticError(
+                "All offsets must be non-negative", 
+                "extract_tile"
+            )
+    
+        # ✅ 检查6: 维度匹配
+        src_shape = list(src.type.shape)
+    
+        if len(offsets_unwrapped) != len(src_shape):
+            raise TLESemanticError(
+                f"Offsets rank ({len(offsets_unwrapped)}) must match "
+                f"source rank ({len(src_shape)})", 
+                "extract_tile"
+            )
+    
+        if len(tile_shape_unwrapped) != len(src_shape):
+            raise TLESemanticError(
+                f"Tile_shape rank ({len(tile_shape_unwrapped)}) must match "
+                f"source rank ({len(src_shape)})", 
+                "extract_tile"
+            )
+    
+        # ✅ 检查7: 边界（如果源shape是静态的）
+        if all(isinstance(dim, int) for dim in src_shape):
+            for i, (offset, tile_dim, src_dim) in enumerate(
+                zip(offsets_unwrapped, tile_shape_unwrapped, src_shape)
+            ):
+                if offset + tile_dim > src_dim:
+                    raise TLESemanticError(
+                        f"Dimension {i}: offset({offset}) + tile_shape({tile_dim}) "
+                        f"> source({src_dim})", 
+                        "extract_tile"
+                    )
+
+
+    def analyze_extract_tile_operation(
+        self, 
+        src: tl.tensor, 
+        offsets: Sequence[int], 
+        tile_shape: Sequence[int]
+    ) -> None:
+        """Analyze extract_tile operation semantics"""
+        self.validate_extract_tile_params(src, offsets, tile_shape)

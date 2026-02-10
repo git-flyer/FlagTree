@@ -352,6 +352,153 @@ def copy(
     else:
         return tmacopy(src, dst, direction, shape, offsets, _semantic)
 
+@tl.builtin
+def extract_tile(
+    x: tl.tensor,
+    offsets,
+    tile_shape: tuple,
+    _semantic=None,
+) -> tl.tensor:
+    """
+    Extract a tile from a tensor with static offsets.
+    
+    Args:
+        x: Source tensor
+        offsets: Static offsets for each dimension (compile-time constants)
+        tile_shape: Tile shape (static)
+    
+    Returns:
+        Extracted tile tensor
+    """
+    # ========================================================================
+    # Step 1: 参数类型检查
+    # ========================================================================
+    if not isinstance(x, tl.tensor):
+        raise ValueError(f"Source must be tl.tensor, but got {type(x)}")
+    
+    # ========================================================================
+    # Step 2: 规范化和验证 offsets
+    # ========================================================================
+    # ✅ 处理 Triton tuple 类型
+    if hasattr(offsets, '__iter__') and not isinstance(offsets, str):
+        # 是可迭代对象（list/tuple/tl.tuple）
+        offsets_list = list(offsets)  # 转换为 Python list
+    else:
+        # 标量
+        offsets_list = [offsets]
+    
+    # 解包 constexpr 值
+    offsets_unwrapped = []
+    for o in offsets_list:
+        # ✅ 递归解包所有可能的包装
+        val = o
+        while hasattr(val, 'value'):
+            val = val.value
+        
+        # ✅ 也尝试 _unwrap_if_constexpr
+        try:
+            val = tl._unwrap_if_constexpr(val)
+        except:
+            pass
+        
+        if not isinstance(val, int):
+            raise ValueError(
+                f"All offsets must be int or tl.constexpr, got {type(val)} (original: {type(o)})"
+            )
+        offsets_unwrapped.append(val)
+    
+    offsets = offsets_unwrapped
+    
+    # ========================================================================
+    # Step 3: 规范化和验证 tile_shape
+    # ========================================================================
+    # ✅ 同样处理 tile_shape
+    if hasattr(tile_shape, '__iter__') and not isinstance(tile_shape, str):
+        tile_shape_list = list(tile_shape)
+    else:
+        tile_shape_list = [tile_shape]
+    
+    # 解包 constexpr 值
+    tile_shape_unwrapped = []
+    for s in tile_shape_list:
+        val = s
+        while hasattr(val, 'value'):
+            val = val.value
+        
+        try:
+            val = tl._unwrap_if_constexpr(val)
+        except:
+            pass
+        
+        if not isinstance(val, int):
+            raise ValueError(
+                f"All tile_shape dims must be int or tl.constexpr, got {type(val)} (original: {type(s)})"
+            )
+        tile_shape_unwrapped.append(val)
+    
+    tile_shape = tile_shape_unwrapped
+    
+    # ========================================================================
+    # Step 4: 基本维度检查
+    # ========================================================================
+    if len(offsets) != len(tile_shape):
+        raise ValueError(
+            f"offsets rank ({len(offsets)}) must match tile_shape rank ({len(tile_shape)})"
+        )
+    
+    src_shape = [tl._unwrap_if_constexpr(dim) for dim in x.type.shape]
+    
+    if len(offsets) != len(src_shape):
+        raise ValueError(
+            f"offsets rank ({len(offsets)}) must match source rank ({len(src_shape)})"
+        )
+    
+    # ========================================================================
+    # Step 5: 边界检查
+    # ========================================================================
+    for i, (offset, tile_dim, src_dim) in enumerate(
+        zip(offsets, tile_shape, src_shape)
+    ):
+        if offset < 0:
+            raise ValueError(
+                f"Dimension {i}: offset ({offset}) must be non-negative"
+            )
+        
+        if isinstance(src_dim, int):
+            if offset + tile_dim > src_dim:
+                raise ValueError(
+                    f"Dimension {i}: offset({offset}) + tile_shape({tile_dim}) "
+                    f"> source({src_dim})"
+                )
+    
+    # ========================================================================
+    # Step 6: 语义验证（可选）
+    # ========================================================================
+    try:
+        from .semantic import TLESemantic
+        if isinstance(_semantic, TLESemantic):
+            _semantic.analyze_extract_tile_operation(x, offsets, tile_shape)
+    except ImportError:
+        pass
+    
+    # ========================================================================
+    # Step 7: 生成 MLIR IR
+    # ========================================================================
+    try:
+        output = _semantic.builder.create_extract_tile(
+            x.handle,
+            offsets,
+            tile_shape
+        )
+        
+        block_type = tl.block_type(x.type.element_ty, tile_shape)
+        return tl.tensor(output, block_type)
+        
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to create extract_tile operation: {str(e)}"
+        ) from e
+
 
 @tl.builtin
 def local_load(

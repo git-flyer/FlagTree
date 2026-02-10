@@ -33,4 +33,5 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     NVGPUIR
     MLIRUBToLLVM
     TleToLLVM # flagtree tle raw
+    TritonTLETransforms 
 )

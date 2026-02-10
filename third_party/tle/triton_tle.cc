@@ -69,11 +69,30 @@ void init_triton_tle_ir(py::module &&m) {
   // Add TLE extensions to the existing TritonOpBuilder class
   builder_cls
       // TLE-Lite
-      .def("create_extract_tile",
+      // .def("create_extract_tile",
+      //       [](TritonOpBuilder &self, Value &input, Value &index,
+      //          std::vector<int64_t> &tileShape) {
+      //         return self.create<tle::ExtractTileOp>(input, index, tileShape);
+      //       })
+     /* .def("create_extract_tile",
             [](TritonOpBuilder &self, Value &input, Value &index,
-               std::vector<int64_t> &tileShape) {
-              return self.create<tle::ExtractTileOp>(input, index, tileShape);
-            })
+               std::vector<int64_t> &tileShape) -> Value {
+              auto op = self.create<tle::ExtractTileOp>(input, index, tileShape);
+              return op.getResult();
+            })*/
+      .def("create_extract_tile",
+           [](TritonOpBuilder &self, Value &input,
+              std::vector<int64_t> &offsets,
+              std::vector<int64_t> &tileShape) -> Value {
+             auto op = self.create<tle::ExtractTileOp>(
+                 input, offsets, tileShape
+             );
+             return op.getResult();
+           },
+           py::arg("input"),
+           py::arg("offsets"),
+           py::arg("tileShape"),
+           "Create extract_tile operation with static offsets")
       .def("create_insert_tile",
             [](TritonOpBuilder &self, Value &input, Value &tile, Value &index) {
               return self.create<tle::InsertTileOp>(input, tile, index);
@@ -179,6 +198,8 @@ void init_triton_tle_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_lower_async_load",
                      tle::createTritonTleLowerAsyncLoad);
   ADD_PASS_WRAPPER_0("add_lower_tma_copy", tle::createTritonTleLowerTmaCopy);
+
+  ADD_PASS_WRAPPER_0("add_lower_extract_tile", tle::createTritonTleLowerExtractTile);
 }
 
 void init_tle_raw_ir(py::module &&m) {

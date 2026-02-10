@@ -814,12 +814,80 @@ public:
   }
 };
 
+// Ensure tle.extract_tile result encoding matches source encoding
+/*class TleExtractTileOpPattern : public OpConversionPattern<tle::ExtractTileOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(tle::ExtractTileOp op, tle::ExtractTileOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto srcType = dyn_cast<RankedTensorType>(adaptor.getSrc().getType());
+    if (!srcType)
+      return failure();
+    auto srcEnc = srcType.getEncoding();
+    if (!srcEnc)
+      return failure();
+    Type retType = op.getType().cloneWithEncoding(srcEnc);
+    addNamedAttrs(rewriter.replaceOpWithNewOp<tle::ExtractTileOp>(
+                      op, retType, adaptor.getSrc(), adaptor.getIndex()),
+                  adaptor.getAttributes());
+    return success();
+  }
+};*/
+
+class TleExtractTileOpPattern : public OpConversionPattern<tle::ExtractTileOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(tle::ExtractTileOp op, 
+                  tle::ExtractTileOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    llvm::errs() << "\n========== TleExtractTileOpPattern ==========\n";
+    llvm::errs() << "Before conversion:\n";
+    op->dump();
+
+    // 获取源tensor的类型和编码
+    auto srcType = dyn_cast<RankedTensorType>(adaptor.getSrc().getType());
+    if (!srcType){
+      llvm::errs() << "ERROR: source is not ranked tensor\n";
+      return op.emitError("source must be a ranked tensor");
+     // return failure();
+    }
+    llvm::errs() << "Source type: " << srcType << "\n";
+    auto srcEnc = srcType.getEncoding();
+    if (srcEnc)
+    //  return failure();
+    {
+      llvm::errs() << srcEnc << "\n";
+    } else {
+      llvm::errs() << "nullptr ❌\n";
+      return op.emitError("source tensor must have encoding attribute");
+    }
+    // 克隆结果类型，但使用源的编码
+    Type retType = op.getType().cloneWithEncoding(srcEnc);
+    
+    // 替换op，保持编码一致性
+    addNamedAttrs(
+        rewriter.replaceOpWithNewOp<tle::ExtractTileOp>(
+            op, retType, adaptor.getSrc(), adaptor.getStaticOffsetsAttr()
+        ),
+        adaptor.getAttributes()
+    );
+    
+    return success();
+  }
+};
+
 // flagtree tle raw
 void populateTleRawPatterns(TritonGPUTypeConverter &typeConverter,
                             RewritePatternSet &patterns) {
   MLIRContext *context = patterns.getContext();
   patterns
-      .add<TleDSLRegionOpPattern, GenericOpPattern<tle::YieldOp>,
+   .add<TleDSLRegionOpPattern, TleExtractTileOpPattern,
+     GenericOpPattern<tle::YieldOp>,
+           GenericOpPattern<tle::InsertTileOp>,
            GenericOpPattern<tle::ExtractAllocatedPtrOp>,
            GenericOpPattern<tle::ExtractAlignedPtrOp>,
            GenericOpPattern<tle::ExtractOffsetOp>,

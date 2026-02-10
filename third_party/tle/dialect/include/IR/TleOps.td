@@ -18,16 +18,51 @@ class Tle_Op<string mnemonic, list<Trait> traits = []> :
 }
 
 // Begin TLE-Lite
+//它要求所有操作数与结果的元素类型一致；但该 op 的第二个操作数是 index（TT_IntLike，即 i32），
+//而 src/result 是 f32 张量，所以类型不一致导致验证失败，删去SameOperandsAndResultElementType
 
-def Tle_ExtractTileOp : Tle_Op<"extract_tile", [Pure,
-                                               SameOperandsAndResultElementType]> {
-  let arguments = (ins TT_Tensor:$src, TT_IntLike:$index);
-  let results = (outs TT_Tensor:$result);
-  let assemblyFormat = [{
-    $src `[` $index `]` attr-dict `:` qualified(type($src)) `,` qualified(type($index)) `->` qualified(type($result))
+
+
+def Tle_ExtractTileOp : Tle_Op<"extract_tile", [Pure]> {
+  let summary = "Extract a tile from a tensor with static offsets";
+  
+  let description = [{
+    Extract a contiguous tile from a tensor based on static offsets.
+    This is a zero-cost operation at runtime - it only reorganizes
+    register values within each thread, with no inter-thread communication.
+    
+    Requirements:
+      1. Offsets must be multiples of CTA tile sizes
+      2. Tile shape must be multiples of CTA tile sizes
+      3. Source and destination layouts must match at CTA tile level
+    
+    Example:
+```mlir
+    %tile = tle.extract_tile %tensor [0, 64] :
+      tensor<128x128xf16, #blocked> to tensor<64x64xf16, #blocked>
+```
   }];
-  let builders = [OpBuilder<(ins "Value":$src, "Value":$index, "ArrayRef<int64_t>":$tile_shape)>];
+  
+  let arguments = (ins 
+    TT_Tensor:$src,
+    DenseI64ArrayAttr:$static_offsets
+  );
+  
+  let results = (outs TT_Tensor:$result);
+  
+  let builders = [
+    OpBuilder<(ins "Value":$src,
+                   "ArrayRef<int64_t>":$static_offsets,
+                   "ArrayRef<int64_t>":$tileShape)>
+  ];
+  
+  let assemblyFormat = [{
+    $src $static_offsets attr-dict `:` type($src) `->` type($result)
+  }];
+  
+  let hasVerifier = 1;
 }
+
 
 def Tle_InsertTileOp : Tle_Op<"insert_tile", [Pure,
                                               DeclareOpInterfaceMethods<InferTypeOpInterface>,
