@@ -3,10 +3,11 @@
  * Licensed under the MIT license.
  */
 
-#ifndef TRITON_TO_LLVM_CONVERSION_PASSES_H
-#define TRITON_TO_LLVM_CONVERSION_PASSES_H
+#ifndef TRITON_ADAPTER_TRITON_TO_LLVM_CONVERSION_PASSES_H
+#define TRITON_ADAPTER_TRITON_TO_LLVM_CONVERSION_PASSES_H
 
 #include "mlir/Pass/Pass.h"
+
 namespace mlir {
 // Forward declarations.
 class ModuleOp;

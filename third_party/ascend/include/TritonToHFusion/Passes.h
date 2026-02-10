@@ -20,8 +20,8 @@
  * THE SOFTWARE.
  */
 
-#ifndef TRITON_TO_HFUSION_CONVERSION_PASSES_H
-#define TRITON_TO_HFUSION_CONVERSION_PASSES_H
+#ifndef TRITON_ADAPTER_TRITON_TO_HFUSION_CONVERSION_PASSES_H
+#define TRITON_ADAPTER_TRITON_TO_HFUSION_CONVERSION_PASSES_H
 
 #include "mlir/Pass/Pass.h"
 
@@ -40,4 +40,4 @@ std::unique_ptr<OperationPass<ModuleOp>> createTritonToHFusionPass();
 } // namespace triton
 } // namespace mlir
 
-#endif // TRITON_TO_HFUSION_CONVERSION_PASSES_H
+#endif // TRITON_ADAPTER_TRITON_TO_HFUSION_CONVERSION_PASSES_H
