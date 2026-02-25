@@ -5,6 +5,7 @@ add_triton_library(TritonTLETransforms
   TleInsertLocalPointerBarriers.cpp
   TleLowerAsyncLoad.cpp
   TleLowerTmaCopy.cpp
+  ConvertArgToMemDesc.cpp
 
   DEPENDS
   TritonTLETransformsIncGen

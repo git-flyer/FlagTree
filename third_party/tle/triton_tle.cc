@@ -25,13 +25,27 @@
 #include "Python.h"
 #include "Transforms/Passes.h"
 #include "ir.h" // TritonOpBuilder
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinDialect.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Value.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
+#include "mlir/Support/LLVM.h"
 #include "passes.h"
 #include "pybind11/pybind11.h"
+#include "pybind11/stl.h"
+#include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/Transforms/Passes.h"
+#include "triton/Conversion/TritonGPUToLLVM/Utility.h"
+#include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
+#include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/Support/Casting.h"
 
 namespace py = pybind11;
@@ -39,6 +53,10 @@ using namespace mlir;
 namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tle = triton::tle;
+
+extern SmallVector<Value> createTLERawRegionByLLVMFunc(
+    TritonOpBuilder &self, std::string_view text, std::string_view fnname,
+    const std::vector<Value> &outputs, const std::vector<Value> &inputs);
 
 void init_triton_tle_ir(py::module &&m) {
   using ret = py::return_value_policy;
@@ -165,6 +183,25 @@ void init_triton_tle_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_lower_tma_copy", tle::createTritonTleLowerTmaCopy);
 }
 
+void init_tle_raw_ir(py::module &&m) {
+  using ret = py::return_value_policy;
+
+  auto *builder_cls = ir::getBuilderClass();
+  builder_cls->def(
+      "create_tle_raw_region_by_llvm_func",
+      [](TritonOpBuilder &self, std::string_view text, std::string_view fnname,
+         const std::vector<Value> &outputs, const std::vector<Value> &inputs) {
+        SmallVector<Value> results =
+            createTLERawRegionByLLVMFunc(self, text, fnname, outputs, inputs);
+        return std::vector<Value>(results.begin(), results.end());
+      });
+}
+
+void init_tle_raw_passes(py::module &&m) {
+  ADD_PASS_WRAPPER_0("add_tle_convert_arg_to_memdesc",
+                     mlir::triton::tle::createTleConvertArgToMemDesc);
+}
+
 void init_triton_tle(py::module &&m) {
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {
@@ -177,4 +214,6 @@ void init_triton_tle(py::module &&m) {
 
   init_triton_tle_ir(m.def_submodule("ir"));
   init_triton_tle_passes(m.def_submodule("passes"));
+  init_tle_raw_ir(m.def_submodule("raw_ir"));
+  init_tle_raw_passes(m.def_submodule("raw_passes"));
 }
