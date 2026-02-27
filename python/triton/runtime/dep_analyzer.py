@@ -178,6 +178,29 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                     return node.func.value.id in ('tl', 'triton')
         return False
 
+    def _resolve_tensor_param(self, symbol: Optional[str]) -> Optional[str]:
+        """
+        给定符号名（例如 TMA 描述符变量名），尝试解析其背后对应的
+        真实 tensor 形参名。
+
+        - 对于 host kernel：描述符本身就是形参，例如 a_desc
+        - 对于 device kernel：描述符通常由 tl.make_tensor_descriptor(base=...) 定义，
+          这里通过依赖分析反推唯一的 input param（如 A）。
+        """
+        if not symbol:
+            return None
+
+        # 如果本身就是输入参数，直接返回
+        if symbol in self.input_params:
+            return symbol
+
+        # 否则通过依赖分析找唯一的 input param
+        input_deps, _ = self.get_dependencies(symbol)
+        if len(input_deps) == 1:
+            return list(input_deps)[0]
+
+        return None
+
     def _is_tl_dot(self, node) -> bool:
         """检查是否是 tl.dot 或 triton.dot 调用"""
         if isinstance(node.func, ast.Attribute):
@@ -392,7 +415,6 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         # 判断依据：tl.dot(a, b) 中 a 的形状为 (M, K)，b 的形状为 (K, N)。
         # K 维度由操作数顺序决定：a 的最后一维必然是 K 维，无需拿 b 的首维做等值比对
         # （等值比对在 M=N 等特殊情况下会误判）。
-        k_dim_results = []
         block_m_map: Dict[str, Set[str]] = {}
         block_k_map: Dict[str, Set[str]] = {}
         has_inconsistent = False
@@ -416,10 +438,12 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                     if a_block_list:
                         # M 维 block 名：a 的第一维
                         m_from_a = a_block_list[0]
-                        if m_from_a is not None and a_desc_name is not None:
+                        # 映射到真实 tensor 形参名（host: a_desc; device: A）
+                        a_tensor_param_for_m = self._resolve_tensor_param(a_desc_name)
+                        if m_from_a is not None and a_tensor_param_for_m is not None:
                             if m_from_a not in block_m_map:
                                 block_m_map[m_from_a] = set()
-                            block_m_map[m_from_a].add(a_desc_name)
+                            block_m_map[m_from_a].add(a_tensor_param_for_m)
                         # K 维 block 名：a 的最后一维
                         k_from_a = a_block_list[-1]
                     break
@@ -443,25 +467,20 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                     and k_from_a != k_from_b):
                 has_inconsistent = True
 
-            k_dim_results.append({
-                'a_desc': a_desc_name,
-                'b_desc': b_desc_name,
-                'a_block_shape': a_block_names,
-                'b_block_shape': b_block_names,
-                'k_from_a': k_from_a,
-                'k_from_b': k_from_b,
-                'k_block': k_block,
-            })
+            # 将参与 tl.dot 的“描述符名”解析为真实的 tensor 形参名
+            a_tensor_param = self._resolve_tensor_param(a_desc_name)
+            b_tensor_param = self._resolve_tensor_param(b_desc_name)
+
             if k_block is not None:
-                # K 维同时与 a_desc 和 b_desc 相关（如果存在）
-                if a_desc_name is not None:
+                # K 维同时与 a / b 对应的 tensor 参数相关（如果存在）
+                if a_tensor_param is not None:
                     if k_block not in block_k_map:
                         block_k_map[k_block] = set()
-                    block_k_map[k_block].add(a_desc_name)
-                if b_desc_name is not None:
+                    block_k_map[k_block].add(a_tensor_param)
+                if b_tensor_param is not None:
                     if k_block not in block_k_map:
                         block_k_map[k_block] = set()
-                    block_k_map[k_block].add(b_desc_name)
+                    block_k_map[k_block].add(b_tensor_param)
 
         # 若任意一次 tl.dot 的 K 维推断结果在 a / b 两侧不一致，
         # 则认为整体分析不可靠，返回空集合让上层逻辑放弃自动调整。
