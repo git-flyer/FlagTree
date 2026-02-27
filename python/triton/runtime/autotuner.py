@@ -168,7 +168,7 @@ class Autotuner(KernelInterface):
         if (desc_name in self.nargs) and \
             isinstance(self.nargs[desc_name], TensorDescriptor) and \
             isinstance(self.nargs[desc_name].base, torch.Tensor):
-            elem_type_size = self.nargs[desc_name].base.element_size()
+            #elem_type_size = self.nargs[desc_name].base.element_size()
 
             base: torch.Tensor = self.nargs[desc_name].base
 
@@ -185,17 +185,40 @@ class Autotuner(KernelInterface):
                         config.kwargs[block_size_name] = block_size
 
 
-    def adjust_block_size_dot_dim(self, current, config, block_size_name_sets, limit):
+    def adjust_block_size_dot_m_dim(self, current, config, block_size_name_sets, limit):
         for block_size_name in block_size_name_sets:
-            if block_size_name in current:
+            if block_size_name in current and block_size_name in self.nargs:
                 block_size = current[block_size_name]
+                if not isinstance(block_size, int):
+                    continue
+                narg = self.nargs[block_size_name]
+                if (isinstance(narg, torch.Tensor)):
+                    elem_type_size = narg.element_size()
+                elif (isinstance(narg, TensorDescriptor) and isinstance(narg.base, torch.Tensor)):
+                    elem_type_size = narg.base.element_size()
+                else:
+                    continue
+                limit = int(limit / elem_type_size)
                 if block_size < limit:
                     block_size = limit
                     if knobs.autotuning.adjust_block_size_print:
-                        print(f'[AABS] tl.dot: Adjust {block_size_name} {current[block_size_name]} => {block_size} because {block_size_name} < {limit}')
+                        print(f'[AABS] tl.dot: Adjust {block_size_name} {current[block_size_name]} => {block_size} because {block_size_name} < {limit}=limit_m')
                     current[block_size_name] = block_size
                     config.kwargs[block_size_name] = block_size
 
+
+    def adjust_block_size_dot_k_dim(self, current, config, block_size_name_sets, limit):
+        for block_size_name in block_size_name_sets:
+            if block_size_name in current:
+                block_size = current[block_size_name]
+                if not isinstance(block_size, int):
+                    return
+                if block_size < limit:
+                    block_size = limit
+                    if knobs.autotuning.adjust_block_size_print:
+                        print(f'[AABS] tl.dot: Adjust {block_size_name} {current[block_size_name]} => {block_size} because {block_size_name} < {limit}=limit_k')
+                    current[block_size_name] = block_size
+                    config.kwargs[block_size_name] = block_size
 
 
     def _auto_adjust_block_sizes(self, current, config):
@@ -226,15 +249,16 @@ class Autotuner(KernelInterface):
         if tma_device_relationships:
             for constexpr, params in tma_device_relationships.items():
                 self.adjust_block_size_tma_device(current, config, constexpr, params)
-            self.adjust_block_size_dot_dim(current, config, block_m_sets, 2)
-            self.adjust_block_size_dot_dim(current, config, block_k_sets, 16)
+            self.adjust_block_size_dot_m_dim(current, config, block_m_sets, 4)
+            self.adjust_block_size_dot_k_dim(current, config, block_k_sets, 16)
 
         if tma_host_relationships:
             for param, block_names_set in tma_host_relationships.items():
                 for block_names in list(block_names_set):
                     block_names = list(block_names)
                     self.adjust_block_size_tma_host(current, config, param, block_names, block_k_sets)
-            self.adjust_block_size_dot_dim(current, config, block_k_sets, 16)
+            self.adjust_block_size_dot_m_dim(current, config, block_m_sets, 4)
+            self.adjust_block_size_dot_k_dim(current, config, block_k_sets, 16)
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
