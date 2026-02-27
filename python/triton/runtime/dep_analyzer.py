@@ -101,6 +101,19 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
             self.var_definitions[var_name] = node.value
         self.generic_visit(node)
 
+    def visit_AugAssign(self, node):
+        """分析类似 x += expr 的增量赋值，把它视作新的定义以便依赖分析"""
+        if isinstance(node.target, ast.Name):
+            var_name = node.target.id
+            # 构造一个等价的 BinOp 表达式：x_new = x_old <op> value
+            binop = ast.BinOp(
+                left=ast.Name(id=var_name, ctx=ast.Load()),
+                op=node.op,
+                right=node.value,
+            )
+            self.var_definitions[var_name] = binop
+        self.generic_visit(node)
+
     def visit_AnnAssign(self, node):
         """分析带注解的赋值语句"""
         if isinstance(node.target, ast.Name):
