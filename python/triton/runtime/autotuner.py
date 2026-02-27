@@ -95,6 +95,7 @@ class Autotuner(KernelInterface):
         self.num_warmups = warmup
         self.num_reps = rep
         self.use_cuda_graph = use_cuda_graph
+        self.seen_tuned_metas = {}  # flagtree: deduplicate tuned meta
 
         # If we got explicitly called via the old interface, raise a warning
         # and proceed with the old behavior.
@@ -258,6 +259,10 @@ class Autotuner(KernelInterface):
         # flagtree tune: 自动从依赖分析结果中获取参数配对
         if knobs.autotuning.adjust_block_size and not isinstance(self.fn, Heuristics):
             self._auto_adjust_block_sizes(current, config)
+        # flagtree: use self.seen_tuned_metas to deduplicate tuned meta
+        meta_key = tuple(sorted(current.items()))
+        if meta_key in self.seen_tuned_metas:
+            return self.seen_tuned_metas[meta_key]
         if knobs.autotuning.adjust_block_size_print:
             print(f'[AABS] Adjusted Config: {config}')
         full_nargs = {**self.nargs, **current}
@@ -281,11 +286,14 @@ class Autotuner(KernelInterface):
             self.post_hook(full_nargs, exception=None)
 
         try:
-            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            rett = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
         except (OutOfResources, CompileTimeAssertionFailure, PTXASError) as e:
             if verbose:
                 print(f"Autotuning failed with {e}")
-            return [float("inf"), float("inf"), float("inf")]
+            rett = [float("inf"), float("inf"), float("inf")]
+
+        self.seen_tuned_metas[meta_key] = rett  # flagtree: deduplicate tuned meta
+        return rett
 
     def check_disk_cache(self, tuning_key, configs, bench_fn):
         # We can't serialize prehooks, so just give up and run the benchmarks.
@@ -345,6 +353,7 @@ class Autotuner(KernelInterface):
                 pruned_configs = self.prune_configs(kwargs)
 
                 def benchmark():
+                    self.seen_tuned_metas = {}  # flagtree: deduplicate tuned meta
                     bench_start = time.time()
                     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
