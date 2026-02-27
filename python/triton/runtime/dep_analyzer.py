@@ -194,6 +194,17 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         if symbol in self.input_params:
             return symbol
 
+        # 如果是通过 tl.make_tensor_descriptor 定义的局部变量，优先从 base 关键字里找
+        if symbol in self.var_definitions:
+            node = self.var_definitions[symbol]
+            if isinstance(node, ast.Call) and self._is_tl_make_tensor_descriptor(node):
+                for kw in node.keywords:
+                    if getattr(kw, "arg", None) == "base" and isinstance(kw.value, ast.Name):
+                        base_name = kw.value.id
+                        # base 通常就是真实的 tensor 形参（如 A/B/C）
+                        if base_name in self.input_params:
+                            return base_name
+
         # 否则通过依赖分析找唯一的 input param
         input_deps, _ = self.get_dependencies(symbol)
         if len(input_deps) == 1:
