@@ -273,8 +273,8 @@ class Autotuner(KernelInterface):
                 for block_names in list(block_names_set):
                     block_names = list(block_names)
                     self.adjust_block_size_tma_host(current, config, param, block_names, set(block_k_map.keys()))
-            self.adjust_block_size_dot_m_dim(current, config, block_m_sets, 4)
-            self.adjust_block_size_dot_k_dim(current, config, block_k_sets, 16)
+            self.adjust_block_size_dot_m_dim(current, config, block_m_map, 4)
+            self.adjust_block_size_dot_k_dim(current, config, block_k_map, 16)
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
