@@ -53,12 +53,22 @@ SmallVector<Value> flatten(TritonOpBuilder &builder,
 //   - TT IR: i32 (IntegerType)
 //   - LLVM func: 1 arg = i32
 //   - Conversion: SignaturePattern::apply directly passes the scalar value
-SmallVector<Value> createTLERawRegionByLLVMFunc(
-    TritonOpBuilder &self, std::string_view text, std::string_view fnname,
-    const std::vector<Value> &outputs, const std::vector<Value> &inputs) {
+SmallVector<Value> createTLERawCall(TritonOpBuilder &self,
+                                    std::string_view text,
+                                    const std::vector<Value> &outputs,
+                                    const std::vector<Value> &inputs) {
   ParserConfig config(self.getContext());
   OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(text, config);
-  LLVM::LLVMFuncOp func = module->lookupSymbol<LLVM::LLVMFuncOp>(fnname);
+  LLVM::LLVMFuncOp func = nullptr;
+  for (auto op : module->getOps<LLVM::LLVMFuncOp>()) {
+    if (!op.empty()) {
+      if (func) {
+        llvm_unreachable("Multiple functions found in LLVM IR text");
+      } else {
+        func = op;
+      }
+    }
+  }
   OpBuilder &builder = self.getBuilder();
   Operation *curOp = builder.getInsertionBlock()->getParentOp();
   while (curOp && curOp->getParentOp() && !isa<ModuleOp>(curOp)) {
@@ -71,12 +81,14 @@ SmallVector<Value> createTLERawRegionByLLVMFunc(
     for (Operation &op : module->getOps()) {
       if ((!isa<SymbolOpInterface>(op) ||
            (isa<SymbolOpInterface>(op) &&
-            !curModule.lookupSymbol(cast<SymbolOpInterface>(op).getName())))) {
+            !curModule.lookupSymbol(cast<SymbolOpInterface>(op).getName()))) &&
+          !isa<LLVM::ModuleFlagsOp>(op)) {
         builder.clone(op);
       }
     }
   };
-  LLVM::LLVMFuncOp funcOp = curModule.lookupSymbol<LLVM::LLVMFuncOp>(fnname);
+  LLVM::LLVMFuncOp funcOp =
+      curModule.lookupSymbol<LLVM::LLVMFuncOp>(func.getSymName());
   SmallVector<Value> operands = {};
   TypeRange tgts = func.getArgumentTypes();
   SmallVector<Value> outs = SmallVector<Value>(outputs.begin(), outputs.end()),

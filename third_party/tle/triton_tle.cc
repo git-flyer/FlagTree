@@ -54,9 +54,10 @@ namespace ttg = triton::gpu;
 namespace ttng = triton::nvidia_gpu;
 namespace tle = triton::tle;
 
-extern SmallVector<Value> createTLERawRegionByLLVMFunc(
-    TritonOpBuilder &self, std::string_view text, std::string_view fnname,
-    const std::vector<Value> &outputs, const std::vector<Value> &inputs);
+extern SmallVector<Value> createTLERawCall(TritonOpBuilder &self,
+                                           std::string_view text,
+                                           const std::vector<Value> &outputs,
+                                           const std::vector<Value> &inputs);
 
 void init_triton_tle_ir(py::module &&m) {
   using ret = py::return_value_policy;
@@ -187,14 +188,13 @@ void init_tle_raw_ir(py::module &&m) {
   using ret = py::return_value_policy;
 
   auto *builder_cls = ir::getBuilderClass();
-  builder_cls->def(
-      "create_tle_raw_region_by_llvm_func",
-      [](TritonOpBuilder &self, std::string_view text, std::string_view fnname,
-         const std::vector<Value> &outputs, const std::vector<Value> &inputs) {
-        SmallVector<Value> results =
-            createTLERawRegionByLLVMFunc(self, text, fnname, outputs, inputs);
-        return std::vector<Value>(results.begin(), results.end());
-      });
+  builder_cls->def("create_tle_raw_call", [](TritonOpBuilder &self,
+                                             std::string_view text,
+                                             const std::vector<Value> &outputs,
+                                             const std::vector<Value> &inputs) {
+    SmallVector<Value> results = createTLERawCall(self, text, outputs, inputs);
+    return std::vector<Value>(results.begin(), results.end());
+  });
 }
 
 void init_tle_raw_passes(py::module &&m) {
