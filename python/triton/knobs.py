@@ -369,8 +369,7 @@ class compilation_knobs(base_knobs):
 class autotuning_knobs(base_knobs):
     cache: env_bool = env_bool("TRITON_CACHE_AUTOTUNING")
     print: env_bool = env_bool("TRITON_PRINT_AUTOTUNING")
-    adjust_block_size: env_bool = env_bool("TRITON_ADJUST_BLOCK_SIZE")
-    adjust_block_size_print: env_bool = env_bool("TRITON_ADJUST_BLOCK_SIZE_PRINT")
+    adjust_block_size: env_bool = env_bool("FLAGTREE_AABS", True)
 
 
 class LaunchHook(Protocol):

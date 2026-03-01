@@ -1,6 +1,7 @@
 import ast
 from typing import Dict, Set, Optional, Tuple, List
 from functools import lru_cache
+from triton import knobs
 
 
 class VariableCollector(ast.NodeVisitor):
@@ -51,7 +52,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         # for make_tensor_descriptor dependencies analyze
         self.tma_args = {} # 存储 tl.make_tensor_descriptor 的 base 及其对应的 stride 和 block shape
         # for TMA descriptor load dependencies analyze
-        self.tma_load_assignments = []  # 存储 tma_desc.load 赋值的目标变量和相关信息
+        self.tma_load_assignments = []  # 存储 desc.load 赋值的目标变量和相关信息
         self.transpose_args_nodes = []  # 存储 tl.trans 参数
         # for tl.dot K-dim analyze
         self.dot_calls: list = []  # 存储 tl.dot 调用节点
@@ -168,7 +169,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         return False
 
     def _is_tma_load(self, node) -> bool:
-        """检查是否是 tma_desc.load 调用"""
+        """检查是否是 desc.load 调用"""
         if isinstance(node.func, ast.Attribute):
             if node.func.attr == 'load':
                 if isinstance(node.func.value, ast.Name):
@@ -233,77 +234,84 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                     return node.func.value.id in ('tl', 'triton')
         return False
 
-    def get_dependencies(self, var_name: str, visited: Optional[Set[str]] = None) -> tuple:
-        """
-        递归获取变量依赖的输入参数和 constexpr
+    def _is_tl_program_id(self, node) -> bool:
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        # program_id
+        if isinstance(func, ast.Name):
+            return func.id == 'program_id'
+        # tl.program_id, language.program_id, triton.program_id
+        if isinstance(func, ast.Attribute) and func.attr == 'program_id':
+            value = func.value
+            if isinstance(value, ast.Name):
+                return value.id in ('tl', 'triton', 'language')
+            # triton.language.program_id
+            if isinstance(value, ast.Attribute):
+                return (value.attr == 'language' and
+                        isinstance(value.value, ast.Name) and
+                        value.value.id == 'triton')
+        return False
 
-        Returns:
-            (input_deps, constexpr_deps): 两个集合
-        """
+    def get_dependencies(self, var_name: str, visited: Optional[Set[str]] = None) -> tuple[Set[str], Set[str]]:
         if visited is None:
-            visited = set()
-
+            visited = set[str]()
         if var_name in visited:
-            return set(), set()
+            return set[str](), set[str]()
         visited.add(var_name)
 
-        input_deps = set()
-        constexpr_deps = set()
+        input_deps = set[str]()
+        constexpr_deps = set[str]()
 
-        # 检查是否是非 constexpr 的输入参数
+        # Check if it is a non-constexpr parameter
         if var_name in self.input_params and var_name not in self.constexpr_params:
             input_deps.add(var_name)
             return input_deps, constexpr_deps
 
-        # 检查是否是 constexpr
+        # Check if it is a constexpr parameter
         if var_name in self.constexpr_params:
             constexpr_deps.add(var_name)
             return input_deps, constexpr_deps
 
-        # 递归分析变量定义
-        if var_name in self.var_definitions and not var_name.startswith('pid'):
+        # Recursively analyze the dependencies of the variable definition
+        if var_name in self.var_definitions:
             definition_node = self.var_definitions[var_name]
-            used_vars = VariableCollector.collect(definition_node)
-            for used_var in used_vars:
-                sub_inputs, sub_constexprs = self.get_dependencies(used_var, visited.copy())
-                input_deps.update(sub_inputs)
-                constexpr_deps.update(sub_constexprs)
-
+            # Skip runtime value program_id
+            if not self._is_tl_program_id(definition_node):
+                used_vars = VariableCollector.collect(definition_node)
+                for used_var in used_vars:
+                    sub_inputs, sub_constexprs = self.get_dependencies(used_var, visited.copy())
+                    input_deps.update(sub_inputs)
+                    constexpr_deps.update(sub_constexprs)
         return input_deps, constexpr_deps
 
-    def _get_dependencies_vars(self, var_name: str, visited: Optional[Set[str]] = None) -> bool:
-        """
-        返回变量 var_name 依赖的所有变量
-        """
-        if visited is None:
-            visited = set()
 
+    def _get_dependencies_vars(self, var_name: str, visited: Optional[Set[str]] = None) -> Set[str]:
+        if visited is None:
+            visited = set[str]()
         if var_name in visited:
             return set()
         visited.add(var_name)
 
         var_deps = set()
 
-        # 检查是否是 输入 或 constexpr 参数
+        # Check if it is an input or constexpr parameter
         if (var_name in self.input_params) or (var_name in self.constexpr_params):
             return var_deps
 
-        # 递归分析变量定义
-        if var_name in self.var_definitions and not var_name.startswith('pid'):
+        # Recursively analyze the dependencies of the variable definition
+        if var_name in self.var_definitions:
             definition_node = self.var_definitions[var_name]
-            used_vars = VariableCollector.collect(definition_node)
-            for used_var in used_vars:
-                used_var_deps = self._get_dependencies_vars(used_var, visited.copy())
-                var_deps.update(used_var_deps)
-
+            # Skip runtime value program_id
+            if not self._is_tl_program_id(definition_node):
+                used_vars = VariableCollector.collect(definition_node)
+                for used_var in used_vars:
+                    var_deps.update(self._get_dependencies_vars(used_var, visited.copy()))
         return var_deps
 
 
     def analyze_tma_with_trans_check(self):
-        """
-        分析TMA描述符load操作及其后续是否有trans操作
-        """
-        tma_desc_relationships = {}
+        tma_map = {}
 
         # 收集 transpose 参数直接使用的变量名
         transpose_used_vars = set()
@@ -321,26 +329,26 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
             addr_exprs = tma_info['addr_exprs']
 
             # 分析TMA load地址表达式中的block names
-            block_names = []
+            bs_names = []
             for addr_expr in addr_exprs:
                 used_vars = VariableCollector.collect(addr_expr)
                 for var_name in used_vars:
                     _, constexpr_deps = self.get_dependencies(var_name)
                     if len(constexpr_deps) == 1:
-                        block_names.append(list(constexpr_deps)[0])
+                        bs_names.append(list(constexpr_deps)[0])
                         break
 
             if target_var in transpose_used_vars:
-                block_names[-1], block_names[-2] = block_names[-2], block_names[-1]
+                bs_names[-1], bs_names[-2] = bs_names[-2], bs_names[-1]
 
             # 添加每个 TMA Descriptor 对应的 block names（可能有多对）
-            if tma_desc_name in tma_desc_relationships.keys():
-                tma_desc_relationships[tma_desc_name].add(tuple(block_names))
+            if tma_desc_name in tma_map.keys():
+                tma_map[tma_desc_name].add(tuple(bs_names))
             else:
-                tma_desc_relationships[tma_desc_name] = set()
-                tma_desc_relationships[tma_desc_name].add(tuple(block_names))
+                tma_map[tma_desc_name] = set()
+                tma_map[tma_desc_name].add(tuple(bs_names))
 
-        return tma_desc_relationships
+        return tma_map
 
     def analyze_dot_dim(self) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
         """
@@ -366,7 +374,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
             tma_desc_name = tma_info['tma_desc_name']
             addr_exprs = tma_info['addr_exprs']
 
-            block_names = []
+            bs_names = []
             for addr_expr in addr_exprs:
                 used_vars = VariableCollector.collect(addr_expr)
                 matched = None
@@ -375,9 +383,9 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                     if len(constexpr_deps) == 1:
                         matched = list(constexpr_deps)[0]
                         break
-                block_names.append(matched)
+                bs_names.append(matched)
 
-            raw_var_block_shape[target_var] = (tma_desc_name, block_names)
+            raw_var_block_shape[target_var] = (tma_desc_name, bs_names)
 
         # Step 2: 处理 tl.trans(src) 赋值，推断 trans 后变量的 block shape
         # e.g. a = tl.trans(a_t) → a 的 block shape 为 a_t 的最后两维交换
@@ -460,11 +468,11 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                 # K 维同时与 a / b 对应的 tensor 参数相关（如果存在）
                 if a_tensor_param is not None:
                     if k_block not in block_k_map:
-                        block_k_map[k_block] = set()
+                        block_k_map[k_block] = set[str]()
                     block_k_map[k_block].add(a_tensor_param)
                 if b_tensor_param is not None:
                     if k_block not in block_k_map:
-                        block_k_map[k_block] = set()
+                        block_k_map[k_block] = set[str]()
                     block_k_map[k_block].add(b_tensor_param)
 
         # 若任意一次 tl.dot 的 K 维推断结果在 a / b 两侧不一致，
@@ -474,80 +482,69 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
 
         return block_m_map, block_k_map
 
-    def analyze_load(self) -> Dict[str, Set[str]]:
-        """
-        分析所有 tl.load 或 TMA相关的地址表达式，返回参数-constexpr 依赖关系
 
-        Returns:
-            dict: {input_param: set(related_constexpr_params)}
-        """
-        relationships = {}
-
+    def analyze_load(self) -> Dict[str, str]:
+        load_map: Dict[str, str] = {}
         for addr_expr in self.load_addresses:
-            # 收集地址表达式中使用的变量
+            # Collect variables used in the address expression
             used_vars = VariableCollector.collect(addr_expr)
-
-            # 分析每个变量的依赖
+            # Analyze dependencies of each variable
             for var_name in used_vars:
                 input_deps, constexpr_deps = self.get_dependencies(var_name)
-                # 如果同时依赖输入参数和 constexpr，且都分别只依赖一个，则记录关系
+                # If depends on both 1 input param and 1 constexpr param
                 if len(input_deps) == 1 and len(constexpr_deps) == 1:
-                    input_dep = list(input_deps)[0]
-                    constexpr_dep = list(constexpr_deps)[0]
-                    relationships[input_dep] = constexpr_dep
+                    bs_name = list(constexpr_deps)[0]
+                    ts_name = list(input_deps)[0]
+                    load_map[bs_name] = ts_name
+        return load_map
 
-        return relationships
 
-
-# 缓存分析结果，避免重复分析
-#_analysis_cache: Dict[int, Tuple[Dict[str, Set[str]]]] = {}
 _analysis_cache: Dict[int, Tuple] = {}
 
 
 def analyze_kernel_dependencies(jit_fn) -> Tuple:
-    # 检查缓存
+    # Check cache
     fn_id = id(jit_fn)
     if fn_id in _analysis_cache:
         return _analysis_cache[fn_id]
 
     try:
-        # 获取函数的 AST
+        # Create analyzer and visit ast
         fn_ast = jit_fn.parse()
-
-        # 创建分析器并分析
         analyzer = KernelDependencyAnalyzer()
         analyzer.visit(fn_ast)
-        load_relationships = analyzer.analyze_load()
-        tma_relationships = analyzer.analyze_tma_with_trans_check()
-        block_m_map, block_k_map = analyzer.analyze_dot_dim()
+        # load_map: Dict[bs_name, ts_name]
+        load_map = analyzer.analyze_load()
+        # tma_map: Dict[desc_name, Set[bs_names: Tuple[bs, bs]]]
+        tma_map = analyzer.analyze_tma_with_trans_check()
+        # bs_m_map, bs_k_map: Dict[bs_name, Set[param_name]]
+        bs_m_map, bs_k_map = analyzer.analyze_dot_dim()
 
-        # 缓存结果
-        _analysis_cache[fn_id] = (load_relationships, tma_relationships, block_m_map, block_k_map)
+        # Cache analysis results
+        _analysis_cache[fn_id] = (load_map, tma_map, bs_m_map, bs_k_map)
 
-        # 可选：打印分析结果
-        import os
-        if os.environ.get('PRINT_FLAGTREE_DEPENDENCY_ANALYZER', '0') == '1':
-            if load_relationships:
-                print(f"\n=== Kernel 依赖分析: {getattr(jit_fn, '__name__', 'unknown')} ===")
-                for param, constexprs in load_relationships.items():
-                    print(f"  输入参数 '{param}' 与常量 {constexprs} 相关")
-            if tma_relationships:
-                print(f"\n=== TMA 输入描述符块形状依赖分析: {getattr(jit_fn, '__name__', 'unknown')} ===")
-                for tma_desc, block_names in tma_relationships.items():
-                    print(f"  TMA 输入描述符 '{tma_desc}' 与块形状 {block_names} 相关")
-            if block_m_map or block_k_map:
-                print(f"\n=== tl.dot 维度分析: {getattr(jit_fn, '__name__', 'unknown')} ===")
-                print(f"  M 维 BLOCK 映射: {block_m_map}")
-                print(f"  K 维 BLOCK 映射: {block_k_map}\n")
+        # Print analysis results
+        if knobs.autotuning.print:
+            if load_map:
+                print(f"\n=== FlagTree dep_analyzer tl.load or tma device: {getattr(jit_fn, '__name__', 'unknown')} ===")
+                for bs_name, ts_name in load_map.items():
+                    print(f"  TensorSize '{bs_name}' is related to BlockSize '{ts_name}'")
+            if tma_map:
+                print(f"\n=== FlagTree dep_analyzer tma device/host: {getattr(jit_fn, '__name__', 'unknown')} ===")
+                for desc_name, bs_names_set in tma_map.items():
+                    print(f"  TMA_desc '{desc_name}' is related to BlockSize '{bs_names_set}'")
+            if bs_m_map or bs_k_map:
+                print(f"\n=== FlagTree dep_analyzer tma tl.dot: {getattr(jit_fn, '__name__', 'unknown')} ===")
+                print(f"  BlockSize_M - set(InputParam) dict: {bs_m_map}")
+                print(f"  BlockSize_K - set(InputParam) dict: {bs_k_map}")
+            print("================================================\n")
 
-        return (load_relationships, tma_relationships, block_m_map, block_k_map)
+        return (load_map, tma_map, bs_m_map, bs_k_map)
 
     except Exception as e:
-        # 分析失败时返回空字典
-        print(f"Warning: Dependency analysis failed: {e}")
+        print(f"Warning: dep_analyzer failed: {e}")
         return {}
 
 
 def clear_analysis_cache():
-    global _analysis_cache
     _analysis_cache.clear()

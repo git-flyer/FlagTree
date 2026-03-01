@@ -7,7 +7,7 @@ import hashlib
 import json
 import math
 from functools import cached_property
-from typing import Dict, Tuple, List, Optional
+from typing import Any, Dict, Tuple, List, Optional
 
 from .. import knobs
 from .jit import KernelInterface, JITFunction
@@ -128,118 +128,108 @@ class Autotuner(KernelInterface):
             return driver.active.get_benchmarker()
         return self._do_bench
 
-    def adjust_block_size_tl_load(self, current, config,
-                                  tensor_size_name, block_size_name):
-        if tensor_size_name in self.nargs and block_size_name in current:
-            tensor_size = self.nargs[tensor_size_name]
-            block_size = current[block_size_name]
-            if not isinstance(tensor_size, int) or not isinstance(block_size, int):
-                return
-            if block_size > tensor_size:
-                from triton import next_power_of_2
-                block_size = next_power_of_2(tensor_size)
-                if knobs.autotuning.adjust_block_size_print:
-                    print(f'[AABS] tl.load: Adjust {block_size_name} {current[block_size_name]} => {block_size} because {block_size_name} > {tensor_size}')
-                current[block_size_name] = block_size
-                config.kwargs[block_size_name] = block_size
+
+    def update_bs(self, current, config, bs_name, bs, title, reason):
+        if knobs.autotuning.print:
+            print(f'[AABS] {title}: adjust {bs_name} {current[bs_name]} => {bs} because {bs_name} {reason}')
+        current[bs_name] = bs
+        config.kwargs[bs_name] = bs
 
 
-    def adjust_block_size_tma(self, current, config, desc_name, block_size_names, block_k_sets: Set[str]):
-        from triton.tools.tensor_descriptor import TensorDescriptor
+    def adjust_block_size_tl_load(self, current, config, bs_name, ts_name):
+        if bs_name not in current or ts_name not in self.nargs:
+            return
+        bs = current[bs_name]
+        ts = self.nargs[ts_name]
+        if not isinstance(bs, int) or not isinstance(ts, int):
+            return
+        if bs > ts:    # block_size > tensor_size
+            from triton import next_power_of_2
+            self.update_bs(current, config, bs_name, next_power_of_2(ts),
+                           "tl.load", f"> {ts}")
+
+
+    def adjust_block_size_tma(self, current, config, desc_name, bs_names):
         import torch
+        from triton.tools.tensor_descriptor import TensorDescriptor
         from triton import next_power_of_2
-        # 对每个 TensorDescriptor 输入参数，检查与之 block shape 相关的 BLOCK_XXX 参数大小
         if desc_name not in self.nargs:
             return
         if not isinstance(self.nargs[desc_name], TensorDescriptor):
             return
-        if not isinstance(self.nargs[desc_name].base, torch.Tensor):
+        desc_base: torch.Tensor = self.nargs[desc_name].base
+        if not isinstance(desc_base, torch.Tensor):
             return
-        base: torch.Tensor = self.nargs[desc_name].base
-        if len(base.shape) != len(block_size_names):
-            if knobs.autotuning.adjust_block_size_print:
-                print(f"[AABS] Warning: len(base.shape)={len(base.shape)} != {len(block_size_names)}=len(block_size_names)")
+        if len(desc_base.shape) != len(bs_names):
+            if knobs.autotuning.print:
+                print(f"[AABS] Warning: len(desc_base.shape)={len(desc_base.shape)} != {len(bs_names)}=len(bs_names)")
             return
-        # 检查 TMA Descriptor 中 tensor 的形状，根据形状调整 BLOCK
-        for tensor_size, block_size_name in zip(base.shape, block_size_names):
-            block_size = current[block_size_name]
-            if block_size > tensor_size:
-                block_size = next_power_of_2(tensor_size)
-                if knobs.autotuning.adjust_block_size_print:
-                    print(f'[AABS] TMA: adjust {block_size_name} {current[block_size_name]} => {block_size} because {block_size_name} > {tensor_size}')
-                current[block_size_name] = block_size
-                config.kwargs[block_size_name] = block_size
+        for shape_size, bs_name in zip[tuple](desc_base.shape, bs_names):
+            bs = current[bs_name]
+            if not isinstance(shape_size, int) or not isinstance(bs, int):
+                continue
+            if bs > shape_size:
+                self.update_bs(current, config, bs_name, next_power_of_2(shape_size),
+                               "TMA", f"> {shape_size}")
 
 
-    def adjust_block_size_dot_m_dim(self, current, config, block_dim_map, limit_bytes):
-        from triton.tools.tensor_descriptor import TensorDescriptor
+    def adjust_block_size_dot_m_dim(self, current, config, bs_dot_map, limit_bytes):
         import torch
+        from triton.tools.tensor_descriptor import TensorDescriptor
 
-        # block_dim_map: {BLOCK_M -> {param_name1, param_name2, ...}}
-        for block_size_name, param_names in block_dim_map.items():
-            if block_size_name not in current:
+        for bs_name, param_names in bs_dot_map.items():
+            if bs_name not in current:
                 continue
-            block_size = current[block_size_name]
-            if not isinstance(block_size, int):
+            bs = current[bs_name]
+            if not isinstance(bs, int):
                 continue
-
-            # 选一个能拿到元素大小的参数（Tensor 或 TensorDescriptor）
             elem_type_size = None
             for pname in param_names:
                 if pname not in self.nargs:
                     continue
                 narg = self.nargs[pname]
+                if isinstance(narg, TensorDescriptor):
+                    narg = narg.base
                 if isinstance(narg, torch.Tensor):
                     elem_type_size = narg.element_size()
                     break
-                if isinstance(narg, TensorDescriptor) and isinstance(narg.base, torch.Tensor):
-                    elem_type_size = narg.base.element_size()
-                    break
             if elem_type_size is None:
                 continue
-            limit_elems = int(limit_bytes / elem_type_size)
-            if block_size < limit_elems:
-                new_block = limit_elems
-                if knobs.autotuning.adjust_block_size_print:
-                    print(f'[AABS] tl.dot: Adjust {block_size_name} {current[block_size_name]} => {new_block} because {block_size_name} < {limit_elems}=limit_m')
-                current[block_size_name] = new_block
-                config.kwargs[block_size_name] = new_block
+            limit = int(limit_bytes / elem_type_size)
+            if bs < limit:
+                self.update_bs(current, config, bs_name, limit,
+                               "tl.dot", f"< {limit}=limit_m")
 
 
-    def adjust_block_size_dot_k_dim(self, current, config, block_dim_map, limit):
-        # block_dim_map: {BLOCK_K -> {param_name1, param_name2, ...}}
-        for block_size_name in block_dim_map.keys():
-            if block_size_name not in current:
+    def adjust_block_size_dot_k_dim(self, current, config, bs_dot_map, limit):
+        for bs_name in bs_dot_map.keys():
+            if bs_name not in current:
                 continue
-            block_size = current[block_size_name]
-            if not isinstance(block_size, int):
+            bs = current[bs_name]
+            if not isinstance(bs, int):
                 continue
-            if block_size < limit:
-                new_block = limit
-                if knobs.autotuning.adjust_block_size_print:
-                    print(f'[AABS] tl.dot: Adjust {block_size_name} {current[block_size_name]} => {new_block} because {block_size_name} < {limit}=limit_k')
-                current[block_size_name] = new_block
-                config.kwargs[block_size_name] = new_block
+            if bs < limit:
+                self.update_bs(current, config, bs_name, limit,
+                               "tl.dot", f"< {limit}=limit_k")
 
 
     def _auto_adjust_block_sizes(self, current, config):
-        load_relationships, tma_relationships, block_m_map, block_k_map = analyze_kernel_dependencies(self.fn)
+        load_map, tma_map, bs_m_map, bs_k_map = analyze_kernel_dependencies(self.fn)
 
-        if load_relationships:
-            if knobs.autotuning.adjust_block_size_print:
+        if load_map:
+            if knobs.autotuning.print:
                 print("[AABS] 1. adjust bs in tl_load or tma_device")
-            for param, constexpr in load_relationships.items():
-                self.adjust_block_size_tl_load(current, config, param, constexpr)
+            for bs_name, ts_name in load_map.items():
+                self.adjust_block_size_tl_load(current, config, bs_name, ts_name)
 
-        if tma_relationships:
-            if knobs.autotuning.adjust_block_size_print:
+        if tma_map:
+            if knobs.autotuning.print:
                 print("[AABS] 2. adjust bs in tma")
-            for param, block_names_set in tma_relationships.items():
-                for block_names in list(block_names_set):
-                    block_names = list(block_names)
-                    self.adjust_block_size_tma(current, config, param, block_names, set(block_k_map.keys()))
-            self.adjust_block_size_dot_m_dim(current, config, block_m_map, 4)
-            self.adjust_block_size_dot_k_dim(current, config, block_k_map, 16)
+            for desc_name, bs_names_set in tma_map.items():
+                for bs_names in bs_names_set:
+                    self.adjust_block_size_tma(current, config, desc_name, bs_names)
+            self.adjust_block_size_dot_m_dim(current, config, bs_m_map, 4)
+            self.adjust_block_size_dot_k_dim(current, config, bs_k_map, 16)
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
@@ -263,7 +253,7 @@ class Autotuner(KernelInterface):
         meta_key = tuple(sorted(current.items()))
         if meta_key in self.seen_tuned_metas:
             return self.seen_tuned_metas[meta_key]
-        if knobs.autotuning.adjust_block_size_print:
+        if knobs.autotuning.print:
             print(f'[AABS] Adjusted Config: {config}')
         full_nargs = {**self.nargs, **current}
 
