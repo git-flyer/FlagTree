@@ -30,8 +30,6 @@ class CUDAJITFunction(object):
                 "-x",
                 "cuda",
                 "--cuda-device-only",
-                "-mllvm",
-                "--nvvm-reflect-add=__CUDA_FTZ=1",
                 "-emit-llvm",
                 "-S",
                 "-",
