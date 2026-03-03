@@ -4,8 +4,10 @@
 # 使用 git merge-file 做三路合并，保留 FlagTree 的特化修改，冲突处留标记供人工处理。
 #
 # 用法:
-#   配置 TRITON_DIR, FLAGTREE_DIR, FLIR_DIR, TRITON_ASCEND_DIR
-#   bash tools/sync_from_triton_ascend.sh [BASE_COMMIT]
+#   export TRITON_ASCEND_DIR=<path>   # 必填：源仓库 triton-ascend
+#   export TRITON_DIR=<path>          # 可选：官方 triton，用于生成与 openai triton 的对比 diff
+#   export FLIR_DIR=<path>            # 可选：flir 子仓库，默认 <flagtree根目录>/third_party/flir
+#   bash tools/sync_ascend/sync_from_triton_ascend.sh [BASE_COMMIT]
 #
 # BASE_COMMIT 默认为 29d243e（上次同步点）。
 # 脚本不会执行 git commit，所有变更保留为工作区修改。
@@ -13,15 +15,37 @@
 set -euo pipefail
 
 # ============================================================
-# 配置
+# 定位 flagtree 项目根目录（从脚本所在目录向上查找 .git）
 # ============================================================
-TRITON_DIR="/home/zhengyang/git/triton-3.2.x"  # 用于生成 flagtree 与 openai triton 的对比，可置空
-FLAGTREE_DIR="/home/zhengyang/FlagTree/flagtree-3.2.x"  # 目标主仓库 flagtree
-FLIR_DIR="${FLAGTREE_DIR}/third_party/flir"    # 目标子仓库 flir：不要求必须置于 flagtree 目录中
-TRITON_ASCEND_DIR="/home/zhengyang/FlagTree/triton-ascend"  # 源仓库 triton-ascend
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_find_git_root() {
+    local _dir="$1"
+    while [[ "${_dir}" != "/" ]]; do
+        [[ -e "${_dir}/.git" ]] && { echo "${_dir}"; return 0; }
+        _dir="$(dirname "${_dir}")"
+    done
+    return 1
+}
+
+FLAGTREE_DIR="$(_find_git_root "${SCRIPT_DIR}")" || {
+    echo "[ERROR] 无法从 '${SCRIPT_DIR}' 向上找到 .git 目录，请在 flagtree 项目内执行脚本。" >&2
+    exit 1
+}
+
+# ============================================================
+# 配置（优先读取环境变量）
+# ============================================================
+if [[ -z "${TRITON_ASCEND_DIR:-}" ]]; then
+    echo "[ERROR] 请设置环境变量 TRITON_ASCEND_DIR，指向 triton-ascend 仓库路径。" >&2
+    exit 1
+fi
+
+TRITON_DIR="${TRITON_DIR:-}"          # 可选，置空则跳过 openai triton 对比
+FLIR_DIR="${FLIR_DIR:-${FLAGTREE_DIR}/third_party/flir}"
+
 BASE_COMMIT="${1:-29d243e}"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MAPPER_PY="${SCRIPT_DIR}/path_mapper.py"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
