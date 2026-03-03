@@ -58,6 +58,8 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         self.dot_calls: list = []  # 存储 tl.dot 调用节点
         # desc 变量名 -> { "shape": [dim_names], "block_shape": [block_names] }（来自 make_tensor_descriptor 或 hook）
         self.tma_desc_defs: Dict[str, Dict[str, List[str]]] = {}
+        # 每个变量的所有历史定义（按出现顺序），用于 arange 提取时不因后续覆盖而丢失信息
+        self.var_all_definitions: Dict[str, List[ast.AST]] = {}
 
     def visit_FunctionDef(self, node):
         """分析函数定义，收集参数信息"""
@@ -118,6 +120,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                 if shape_names or block_names:
                     self.tma_desc_defs[var_name] = {"shape": shape_names, "block_shape": block_names}
 
+            self.var_all_definitions.setdefault(var_name, []).append(node.value)
             self.var_definitions[var_name] = node.value
         self.generic_visit(node)
 
@@ -268,6 +271,29 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
             if isinstance(child, ast.Call) and self._is_tl_arange(child) and len(child.args) >= 2:
                 if isinstance(child.args[1], ast.Name):
                     out.add(child.args[1].id)
+        return out
+
+    def _extract_arange_block_sizes_recursive(self, var_name: str, visited: Optional[Set[str]] = None) -> Set[str]:
+        """
+        递归追踪变量的所有历史定义，提取其中 tl.arange(?, size) 的 size 名。
+
+        之所以要搜索"所有历史定义"而不只是最后一个，是因为像
+          rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)  # 含 arange
+          rm = rm.to(tl.int64)                           # 后续覆盖，丢失 arange
+        这样的模式会让 var_definitions['rm'] 指向后者，而 arange 在前者里。
+        """
+        if visited is None:
+            visited = set()
+        if var_name in visited:
+            return set()
+        visited.add(var_name)
+
+        out: Set[str] = set()
+        for def_node in self.var_all_definitions.get(var_name, []):
+            out.update(self._extract_arange_block_sizes(def_node))
+            for child_var in VariableCollector.collect(def_node):
+                if child_var != var_name and not child_var.startswith('pid'):
+                    out.update(self._extract_arange_block_sizes_recursive(child_var, visited.copy()))
         return out
 
     def get_dependencies(self, var_name: str, visited: Optional[Set[str]] = None) -> tuple[Set[str], Set[str]]:
@@ -460,10 +486,10 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         for addr_expr in self.load_addresses:
             used_vars = VariableCollector.collect(addr_expr)
             for var_name in used_vars:
-                if var_name not in self.var_definitions or var_name.startswith("pid"):
+                if var_name not in self.var_all_definitions or var_name.startswith("pid"):
                     continue
-                def_node = self.var_definitions[var_name]
-                blocks = self._extract_arange_block_sizes(def_node)
+                # 用递归搜索所有历史定义，避免 rm = rm.to(int64) 覆盖含 arange 的早期定义
+                blocks = self._extract_arange_block_sizes_recursive(var_name)
                 input_deps, _ = self.get_dependencies(var_name)
                 if len(input_deps) == 1 and len(blocks) == 1:
                     dim_name = list(input_deps)[0]
