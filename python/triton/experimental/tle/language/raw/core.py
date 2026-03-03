@@ -4,7 +4,9 @@ from triton.language.core import builtin, tensor
 
 @builtin
 def call(func, outputs, inputs, _semantic=None):
-    results = _semantic.builder.create_tle_raw_call(func.llvm, [output.handle for output in outputs],
+    context = _semantic.builder.get_context()
+    llvm = func.make_llvm(context)
+    results = _semantic.builder.create_tle_raw_call(llvm, [output.handle for output in outputs],
                                                     [input.handle for input in inputs])
     tensors = [tensor(result, output.type) for result, output in zip(results, outputs)]
     if len(tensors) == 1:

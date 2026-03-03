@@ -38,6 +38,7 @@
 #include "mlir/Target/LLVMIR/Import.h"
 #include "passes.h"
 #include "pybind11/pybind11.h"
+#include "pybind11/pytypes.h"
 #include "pybind11/stl.h"
 #include "tle/dialect/include/IR/Dialect.h"
 #include "tle/dialect/include/Transforms/Passes.h"
@@ -201,6 +202,7 @@ void init_tle_raw_ir(py::module &&m) {
     SmallVector<Value> results = createTLERawCall(self, text, outputs, inputs);
     return std::vector<Value>(results.begin(), results.end());
   });
+  builder_cls->def("get_context", &TritonOpBuilder::getContext);
 }
 
 void init_tle_raw_passes(py::module &&m) {
@@ -210,7 +212,7 @@ void init_tle_raw_passes(py::module &&m) {
 
 void init_llvm(py::module &&m) {
   using ret = py::return_value_policy;
-  m.def("parse",
+  m.def("parse_llvm_ir",
         [](std::string_view text, llvm::LLVMContext &llvmContext,
            mlir::MLIRContext &mlirContext) -> mlir::ModuleOp {
           std::unique_ptr<llvm::MemoryBuffer> buffer =

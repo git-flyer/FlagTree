@@ -5,8 +5,8 @@ from pathlib import Path
 import subprocess
 from typing import Any, Dict, Final
 
-from triton._C.libtriton import ir, llvm  # pyright: ignore[reportMissingImports]
-from triton._C.libtriton.tle.llvm import parse  # pyright: ignore[reportMissingImports]
+from triton._C.libtriton import llvm  # pyright: ignore[reportMissingImports]
+from triton._C.libtriton.tle.llvm import parse_llvm_ir  # pyright: ignore[reportMissingImports]
 
 # TODO: We use cli tools to compile CUDA code temporarily, and plan to replace it with LLVM components Python bindings in the future.
 CLANG = os.getenv("CLANG", "clang")
@@ -23,8 +23,7 @@ class CUDAJITFunction(object):
     def __deepcopy__(self, memo: Dict[int, Any]) -> CUDAJITFunction:
         return self.__class__(copy.deepcopy(self.fn, memo), copy.deepcopy(self.pipeline, memo), self.context)
 
-    @property
-    def llvm(self) -> str:
+    def make_llvm(self, mlir_context) -> str:
         build = subprocess.run(
             [
                 CLANG,
@@ -43,7 +42,5 @@ class CUDAJITFunction(object):
             capture_output=True,
         )
         llvm_context = llvm.context()
-        mlir_context = ir.context()
-        ir.load_dialects(mlir_context)
-        module = parse(build.stdout.decode(), llvm_context, mlir_context)
+        module = parse_llvm_ir(build.stdout.decode(), llvm_context, mlir_context)
         return f"{module}"
