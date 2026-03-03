@@ -56,6 +56,8 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         self.transpose_args_nodes = []  # 存储 tl.trans 参数
         # for tl.dot K-dim analyze
         self.dot_calls: list = []  # 存储 tl.dot 调用节点
+        # desc 变量名 -> { "shape": [dim_names], "block_shape": [block_names] }（来自 make_tensor_descriptor 或 hook）
+        self.tma_desc_defs: Dict[str, Dict[str, List[str]]] = {}
 
     def visit_FunctionDef(self, node):
         """分析函数定义，收集参数信息"""
@@ -98,6 +100,23 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                     'tma_desc_name': tma_desc_name,
                     'addr_exprs': addr_exprs
                 })
+
+            # TMA device: 记录 make_tensor_descriptor 的 LHS 及 shape / block_shape（用于按 block_shape 分析 bs）
+            if (isinstance(node.value, ast.Call) and
+                    self._is_tl_make_tensor_descriptor(node.value)):
+                shape_names = []
+                block_names = []
+                for kw in node.value.keywords:
+                    if getattr(kw, 'arg', None) == 'shape' and isinstance(kw.value, ast.List):
+                        for elt in kw.value.elts:
+                            if isinstance(elt, ast.Name):
+                                shape_names.append(elt.id)
+                    if getattr(kw, 'arg', None) == 'block_shape' and isinstance(kw.value, ast.List):
+                        for elt in kw.value.elts:
+                            if isinstance(elt, ast.Name):
+                                block_names.append(elt.id)
+                if shape_names or block_names:
+                    self.tma_desc_defs[var_name] = {"shape": shape_names, "block_shape": block_names}
 
             self.var_definitions[var_name] = node.value
         self.generic_visit(node)
@@ -234,6 +253,22 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                     return node.func.value.id in ('tl', 'triton')
         return False
 
+    def _is_tl_arange(self, node) -> bool:
+        """检查是否是 tl.arange 或 triton.arange 调用"""
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr == 'arange':
+                if isinstance(node.func.value, ast.Name):
+                    return node.func.value.id in ('tl', 'triton')
+        return False
+
+    def _extract_arange_block_sizes(self, node: ast.AST) -> Set[str]:
+        """从表达式中提取所有 tl.arange(?, size) 的 size 变量名（即 block 名）。"""
+        out: Set[str] = set()
+        for child in ast.walk(node):
+            if isinstance(child, ast.Call) and self._is_tl_arange(child) and len(child.args) >= 2:
+                if isinstance(child.args[1], ast.Name):
+                    out.add(child.args[1].id)
+        return out
 
     def get_dependencies(self, var_name: str, visited: Optional[Set[str]] = None) -> tuple[Set[str], Set[str]]:
         if visited is None:
@@ -292,46 +327,6 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         return var_deps
 
 
-    def analyze_tma_with_trans_check(self):
-        tma_map = {}
-
-        # 收集 transpose 参数直接使用的变量名
-        transpose_used_vars = set()
-        for arg_node in self.transpose_args_nodes:
-            used_vars = VariableCollector.collect(arg_node)
-            # 收集地址表达式中使用的变量
-            for var_name in used_vars:
-                transpose_used_vars.add(var_name)
-                transpose_used_vars.update(self._get_dependencies_vars(var_name))
-
-        # 检查每个TMA load后面是否紧跟trans调用
-        for tma_info in self.tma_load_assignments:
-            target_var = tma_info['var_name']
-            tma_desc_name = tma_info['tma_desc_name']
-            addr_exprs = tma_info['addr_exprs']
-
-            # 分析TMA load地址表达式中的block names
-            bs_names = []
-            for addr_expr in addr_exprs:
-                used_vars = VariableCollector.collect(addr_expr)
-                for var_name in used_vars:
-                    _, constexpr_deps = self.get_dependencies(var_name)
-                    if len(constexpr_deps) == 1:
-                        bs_names.append(list(constexpr_deps)[0])
-                        break
-
-            if target_var in transpose_used_vars and len(bs_names) >= 2:
-                bs_names[-1], bs_names[-2] = bs_names[-2], bs_names[-1]
-
-            # 添加每个 TMA Descriptor 对应的 block names（可能有多对）
-            if tma_desc_name in tma_map.keys():
-                tma_map[tma_desc_name].add(tuple(bs_names))
-            else:
-                tma_map[tma_desc_name] = set()
-                tma_map[tma_desc_name].add(tuple(bs_names))
-
-        return tma_map
-
     def analyze_dot_dim(self) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
         """
         分析 tl.dot(a, b) 调用中 M / K 维度对应的 BLOCK constexpr 变量。
@@ -349,24 +344,13 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
               block_m_map: {BLOCK_M 名 -> 使用该 M 维的 tensor / descriptor 参数名集合}
               block_k_map: {BLOCK_K 名 -> 使用该 K 维的 tensor / descriptor 参数名集合（通过一致性校验）}
         """
-        # Step 1: 为每个 TMA load 目标变量推断原始 block shape（不含 trans 翻转效果）
+        # Step 1: 为每个 TMA load 目标变量推断 block shape，来源为 desc.block_shape（make_tensor_descriptor 或 pre_hook），而非地址偏移依赖
+        desc_block_shapes = getattr(self, "_desc_block_shapes", {})
         raw_var_block_shape: Dict[str, tuple] = {}
         for tma_info in self.tma_load_assignments:
             target_var = tma_info['var_name']
             tma_desc_name = tma_info['tma_desc_name']
-            addr_exprs = tma_info['addr_exprs']
-
-            bs_names = []
-            for addr_expr in addr_exprs:
-                used_vars = VariableCollector.collect(addr_expr)
-                matched = None
-                for var_name in used_vars:
-                    _, constexpr_deps = self.get_dependencies(var_name)
-                    if len(constexpr_deps) == 1:
-                        matched = list(constexpr_deps)[0]
-                        break
-                bs_names.append(matched)
-
+            bs_names = list(desc_block_shapes.get(tma_desc_name) or [])
             raw_var_block_shape[target_var] = (tma_desc_name, bs_names)
 
         # Step 2: 处理 tl.trans(src) 赋值，推断 trans 后变量的 block shape
@@ -465,60 +449,169 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         return block_m_map, block_k_map
 
 
-    def analyze_load(self) -> Dict[str, str]:
+    # ---------- 分析函数一：仅针对普通 tl.load，通过地址依赖的 tl.arange 得到 dim -> BLOCK 的对应 ----------
+    def analyze_tl_load_dim_to_bs(self) -> Dict[str, str]:
+        """
+        仅分析普通 tl.load：从地址表达式中找到依赖的 tl.arange(0, BLOCK_X)，
+        用 BLOCK_X 作为该维的 bs；维度名 M/N/K 从该索引变量的 input 依赖推断。
+        返回: { "M": "BLOCK_M", "N": "BLOCK_N", "K": "BLOCK_K" } 形式的 map。
+        """
         load_map: Dict[str, str] = {}
         for addr_expr in self.load_addresses:
-            # Collect variables used in the address expression
             used_vars = VariableCollector.collect(addr_expr)
-            # Analyze dependencies of each variable
             for var_name in used_vars:
-                input_deps, constexpr_deps = self.get_dependencies(var_name)
-                # If depends on both 1 input param and 1 constexpr param
-                if len(input_deps) == 1 and len(constexpr_deps) == 1:
-                    bs_name = list(constexpr_deps)[0]
-                    ts_name = list(input_deps)[0]
-                    load_map[bs_name] = ts_name
+                if var_name not in self.var_definitions or var_name.startswith("pid"):
+                    continue
+                def_node = self.var_definitions[var_name]
+                blocks = self._extract_arange_block_sizes(def_node)
+                input_deps, _ = self.get_dependencies(var_name)
+                if len(input_deps) == 1 and len(blocks) == 1:
+                    dim_name = list(input_deps)[0]
+                    block_name = list(blocks)[0]
+                    load_map[dim_name] = block_name
         return load_map
+
+    # ---------- 分析函数二：仅针对 desc.load，通过 desc.block_shape 得到 M/N/K 与 BLOCK_* 及 a_desc/b_desc ----------
+    def _parse_hook_block_shape_assignments(self, hook_ast: ast.FunctionDef) -> Dict[str, List[str]]:
+        """解析 pre_hook 函数体中 nargs['desc_name'].block_shape = [B1, B2, ...] 的赋值，返回 desc_key -> [block_names]。"""
+        hook_desc_block: Dict[str, List[str]] = {}
+        for node in ast.walk(hook_ast):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            t = node.targets[0]
+            if not isinstance(t, ast.Attribute) or t.attr != "block_shape":
+                continue
+            # t.value 应为 nargs["a_desc"] 等形式
+            if not isinstance(t.value, ast.Subscript):
+                continue
+            sub = t.value
+            if not isinstance(sub.value, ast.Name):
+                continue
+            key = None
+            if isinstance(sub.slice, ast.Constant):
+                key = sub.slice.value
+            elif getattr(sub.slice, "value", None) is not None and isinstance(sub.slice.value, ast.Constant):
+                key = sub.slice.value.value
+            try:
+                if key is None:
+                    key = ast.literal_eval(sub.slice)
+            except Exception:
+                pass
+            if not isinstance(key, str):
+                continue
+            if not isinstance(node.value, ast.List):
+                continue
+            block_names = []
+            for elt in node.value.elts:
+                if isinstance(elt, ast.Name):
+                    block_names.append(elt.id)
+            if block_names:
+                hook_desc_block[key] = block_names
+        return hook_desc_block
+
+    def analyze_desc_load_dim_to_bs(
+        self, pre_hook_fn: Optional[object] = None
+    ) -> Tuple[Dict[str, Set[Tuple[str, ...]]], Dict[str, List[str]]]:
+        """
+        仅分析 desc.load（TMA device / host）：
+        - TMA device：从 tl.make_tensor_descriptor(..., shape=..., block_shape=...) 读 block_shape，与 shape 对应得到各维的 BLOCK。
+        - TMA host：描述符为入参，block_shape 可能在 pre_hook 里赋值为 nargs['a_desc'].block_shape = [BLOCK_M, BLOCK_K]；若传入 pre_hook_fn 则解析其 AST。
+        返回:
+          tma_map: 与现有 autotuner 兼容，{ desc_name: set of (block_name, ...) }，用于按 desc 调整 block。
+          desc_block_shapes: { desc_name: [block_name, ...] }，供 analyze_dot_dim 使用。
+        """
+        # 1) 从 make_tensor_descriptor 得到 desc -> block_shape（及 shape）
+        desc_block_shapes: Dict[str, List[str]] = {}
+        for desc_name, defn in self.tma_desc_defs.items():
+            blist = defn.get("block_shape") or []
+            if blist:
+                desc_block_shapes[desc_name] = list(blist)
+
+        # 2) 从 pre_hook 解析 nargs["x"].block_shape = [...]，合并到 desc_block_shapes（覆盖或补充 host 描述符）
+        if pre_hook_fn is not None and hasattr(pre_hook_fn, "__code__"):
+            try:
+                import inspect
+                try:
+                    hook_src = inspect.getsource(pre_hook_fn)
+                except Exception:
+                    hook_src = None
+                if hook_src:
+                    hook_ast = ast.parse(hook_src)
+                    for n in ast.walk(hook_ast):
+                        if isinstance(n, ast.FunctionDef):
+                            for k, v in self._parse_hook_block_shape_assignments(n).items():
+                                desc_block_shapes[k] = v
+                            break
+            except Exception:
+                pass
+
+        # 3) 构建 tma_map：每个 desc 的 load 对应一个 block 元组（考虑 trans 时交换最后两维）
+        transpose_used_vars = set()
+        for arg_node in self.transpose_args_nodes:
+            for v in VariableCollector.collect(arg_node):
+                transpose_used_vars.add(v)
+                transpose_used_vars.update(self._get_dependencies_vars(v))
+
+        tma_map: Dict[str, Set[Tuple[str, ...]]] = {}
+        for tma_info in self.tma_load_assignments:
+            desc_name = tma_info["tma_desc_name"]
+            target_var = tma_info["var_name"]
+            block_list = list(desc_block_shapes.get(desc_name) or [])
+            if target_var in transpose_used_vars and len(block_list) >= 2:
+                block_list[-1], block_list[-2] = block_list[-2], block_list[-1]
+            if block_list:
+                tma_map.setdefault(desc_name, set()).add(tuple(block_list))
+        # 供 analyze_dot_dim 使用
+        self._desc_block_shapes: Dict[str, List[str]] = desc_block_shapes
+        return tma_map, desc_block_shapes
 
 
 _analysis_cache: Dict[int, Tuple] = {}
 
 
-def analyze_kernel_dependencies(jit_fn) -> Tuple:
-    # Check cache
-    fn_id = id(jit_fn)
-    if fn_id in _analysis_cache:
-        return _analysis_cache[fn_id]
+def analyze_kernel_dependencies(jit_fn, pre_hook_fn: Optional[object] = None) -> Tuple:
+    """
+    分析 kernel 的 block size 依赖，供 autotuner 调整用。
+    :param jit_fn: JIT 过的 kernel 函数
+    :param pre_hook_fn: 可选，TMA host 时设置 block_shape 的 pre_hook（如 matmul_tma_set_block_size_hook），用于解析 nargs["a_desc"].block_shape = [...]
+    :return: (load_map, tma_map, bs_m_map, bs_k_map)
+      - load_map: 仅 tl.load，dim -> BLOCK（如 M -> BLOCK_M），由 tl.arange 推断
+      - tma_map: 仅 desc.load，desc_name -> set of (block_name, ...)，由 desc.block_shape 推断
+      - bs_m_map / bs_k_map: tl.dot 的 M/K 维 BLOCK -> 参与该维的 tensor 参数名集合
+    """
+    cache_key = (id(jit_fn), id(pre_hook_fn) if pre_hook_fn is not None else None)
+    if cache_key in _analysis_cache:
+        return _analysis_cache[cache_key]
 
     try:
-        # Create analyzer and visit ast
         fn_ast = jit_fn.parse()
         analyzer = KernelDependencyAnalyzer()
         analyzer.visit(fn_ast)
-        # load_map: Dict[bs_name, ts_name]
-        load_map = analyzer.analyze_load()
-        # tma_map: Dict[desc_name, Set[bs_names: Tuple[bs, bs]]]
-        tma_map = analyzer.analyze_tma_with_trans_check()
-        # bs_m_map, bs_k_map: Dict[bs_name, Set[param_name]]
+
+        # 分析函数一：仅普通 tl.load，通过 tl.arange 得到 dim -> BLOCK
+        load_map = analyzer.analyze_tl_load_dim_to_bs()
+
+        # 分析函数二：仅 desc.load，通过 desc.block_shape（make_tensor_descriptor 或 pre_hook）得到 tma_map，并写入 _desc_block_shapes 供 dot 用
+        tma_map, _ = analyzer.analyze_desc_load_dim_to_bs(pre_hook_fn=pre_hook_fn)
+
+        # tl.dot 的 M/K 维映射（内部使用 _desc_block_shapes）
         bs_m_map, bs_k_map = analyzer.analyze_dot_dim()
 
-        # Cache analysis results
-        _analysis_cache[fn_id] = (load_map, tma_map, bs_m_map, bs_k_map)
+        _analysis_cache[cache_key] = (load_map, tma_map, bs_m_map, bs_k_map)
 
-        # Print analysis results
         if knobs.autotuning.print:
             if load_map:
-                print(f"\n=== FlagTree dep_analyzer tl.load or tma device: {getattr(jit_fn, '__name__', 'unknown')} ===")
-                for bs_name, ts_name in load_map.items():
-                    print(f"  TensorSize '{bs_name}' is related to BlockSize '{ts_name}'")
+                print(f"\n=== FlagTree dep_analyzer tl.load (by tl.arange): {getattr(jit_fn, '__name__', 'unknown')} ===")
+                for dim_name, block_name in load_map.items():
+                    print(f"  dim '{dim_name}' -> block '{block_name}'")
             if tma_map:
-                print(f"\n=== FlagTree dep_analyzer tma device/host: {getattr(jit_fn, '__name__', 'unknown')} ===")
+                print(f"\n=== FlagTree dep_analyzer desc.load (by block_shape): {getattr(jit_fn, '__name__', 'unknown')} ===")
                 for desc_name, bs_names_set in tma_map.items():
-                    print(f"  TMA_desc '{desc_name}' is related to BlockSize '{bs_names_set}'")
+                    print(f"  desc '{desc_name}' -> block shapes {bs_names_set}")
             if bs_m_map or bs_k_map:
-                print(f"\n=== FlagTree dep_analyzer tma tl.dot: {getattr(jit_fn, '__name__', 'unknown')} ===")
-                print(f"  BlockSize_M - set(InputParam) dict: {bs_m_map}")
-                print(f"  BlockSize_K - set(InputParam) dict: {bs_k_map}")
+                print(f"\n=== FlagTree dep_analyzer tl.dot: {getattr(jit_fn, '__name__', 'unknown')} ===")
+                print(f"  BLOCK_M -> params: {bs_m_map}")
+                print(f"  BLOCK_K -> params: {bs_k_map}")
             print("================================================\n")
 
         return (load_map, tma_map, bs_m_map, bs_k_map)

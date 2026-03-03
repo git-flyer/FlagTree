@@ -214,13 +214,14 @@ class Autotuner(KernelInterface):
 
 
     def _auto_adjust_block_sizes(self, current, config):
-        load_map, tma_map, bs_m_map, bs_k_map = analyze_kernel_dependencies(self.fn)
+        pre_hook_fn = getattr(config, "pre_hook", None) or (self.configs[0].pre_hook if self.configs else None)
+        load_map, tma_map, bs_m_map, bs_k_map = analyze_kernel_dependencies(self.fn, pre_hook_fn=pre_hook_fn)
 
         if load_map:
             if knobs.autotuning.print:
-                print("[AABS] 1. adjust bs in tl_load or tma_device")
-            for bs_name, ts_name in load_map.items():
-                self.adjust_block_size_tl_load(current, config, bs_name, ts_name)
+                print("[AABS] 1. adjust bs in tl_load (by tl.arange)")
+            for ts_name, bs_name in load_map.items():
+                self.adjust_block_size_tl_load(current, config, ts_name, bs_name)
 
         if tma_map:
             if knobs.autotuning.print:
