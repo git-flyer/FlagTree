@@ -255,7 +255,7 @@ class Autotuner(KernelInterface):
                     else:
                         nargs_parts.append(f'{k}={v}')
                 nargs_str = ', '.join(nargs_parts)
-            print(f'[AABS] ==== Finish: kernel={self.base_fn.__name__}; nargs=({nargs_str})')
+            print(f'[AABS] ==== Finish: {self.base_fn.__name__}({nargs_str})')
             print(f'[AABS] ====         adjusted_config={config}')
 
     def _bench(self, *args, config, **meta):
