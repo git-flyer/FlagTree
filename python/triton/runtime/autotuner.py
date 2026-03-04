@@ -173,11 +173,29 @@ class Autotuner(KernelInterface):
                                "TMA", f"> {shape_size}")
 
 
-    def adjust_block_size_dot_m_dim(self, current, config, bs_dot_map, limit_bytes):
+    def adjust_block_size_dot_k_dim(self, current, config, bs_k_map, limit):
+        for bs_name in bs_k_map.keys():
+            if bs_name not in current:
+                continue
+            bs = current[bs_name]
+            if not isinstance(bs, int):
+                continue
+            if bs < limit:
+                self.update_bs(current, config, bs_name, limit,
+                               "tl.dot", f"< {limit}=limit_k")
+
+
+    def adjust_block_size_dot_m_dim(self, current, config, bs_k_map, bs_m_map, limit_bytes):
         import torch
         from triton.tools.tensor_descriptor import TensorDescriptor
 
-        for bs_name, param_names in bs_dot_map.items():
+        bs_k = 1
+        for k_name in bs_k_map.keys():
+            if k_name in current and isinstance(current[k_name], int):
+                bs_k = current[k_name]
+                break
+
+        for bs_name, param_names in bs_m_map.items():
             if bs_name not in current:
                 continue
             bs = current[bs_name]
@@ -195,22 +213,15 @@ class Autotuner(KernelInterface):
                     break
             if elem_type_size is None:
                 continue
-            limit = int(limit_bytes / elem_type_size)
+            # SWIZZLE_NONE: bs_k * elem_type_size = 16B, limit = 8
+            # SWIZZLE_16B:  bs_k * elem_type_size = 16B, limit = 8
+            # SWIZZLE_32B:  bs_k * elem_type_size = 32B, limit = 4
+            # SWIZZLE_64B:  bs_k * elem_type_size = 64B, limit = 2
+            # SWIZZLE_128B: bs_k * elem_type_size = 128B, limit = 1
+            limit = max(int(limit_bytes / bs_k / elem_type_size), 1)
             if bs < limit:
                 self.update_bs(current, config, bs_name, limit,
                                "tl.dot", f"< {limit}=limit_m")
-
-
-    def adjust_block_size_dot_k_dim(self, current, config, bs_dot_map, limit):
-        for bs_name in bs_dot_map.keys():
-            if bs_name not in current:
-                continue
-            bs = current[bs_name]
-            if not isinstance(bs, int):
-                continue
-            if bs < limit:
-                self.update_bs(current, config, bs_name, limit,
-                               "tl.dot", f"< {limit}=limit_k")
 
 
     def _auto_adjust_block_sizes(self, current, config):
@@ -229,8 +240,23 @@ class Autotuner(KernelInterface):
             for desc_name, bs_names_set in tma_map.items():
                 for bs_names in bs_names_set:
                     self.adjust_block_size_tma(current, config, desc_name, bs_names)
-            self.adjust_block_size_dot_m_dim(current, config, bs_m_map, 4)
             self.adjust_block_size_dot_k_dim(current, config, bs_k_map, 16)
+            self.adjust_block_size_dot_m_dim(current, config, bs_k_map, bs_m_map, 128)
+
+        if knobs.autotuning.print:
+            nargs_str = ''
+            if self.nargs:
+                import torch
+                from triton.tools.tensor_descriptor import TensorDescriptor
+                nargs_parts = []
+                for k, v in self.nargs.items():
+                    if isinstance(v, (torch.Tensor, TensorDescriptor)):
+                        nargs_parts.append(k)
+                    else:
+                        nargs_parts.append(f'{k}={v}')
+                nargs_str = ', '.join(nargs_parts)
+            print(f'[AABS] ==== Finish: kernel={self.base_fn.__name__}; nargs=({nargs_str})')
+            print(f'[AABS] ====         adjusted_config={config}')
 
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
@@ -254,8 +280,6 @@ class Autotuner(KernelInterface):
         meta_key = tuple(sorted(current.items()))
         if meta_key in self.seen_tuned_metas:
             return self.seen_tuned_metas[meta_key]
-        if knobs.autotuning.print:
-            print(f'[AABS] Adjusted Config: {config}')
         full_nargs = {**self.nargs, **current}
 
         def kernel_call():
