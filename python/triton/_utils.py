@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 from functools import reduce
-from typing import Any, Callable, TYPE_CHECKING, Union, List, Dict, Tuple
+from typing import Any, Callable, TYPE_CHECKING, Union, List, Dict
 
 if TYPE_CHECKING:
     from .language import core
-    IterableType = Union[List[Any], Tuple[Any, ...], core.tuple, core.tuple_type]
-    ObjPath = Tuple[int, ...]
+    IterableType = Union[list[Any], tuple[Any, ...], core.tuple, core.tuple_type]
+    ObjPath = tuple[int, ...]
 
 TRITON_MAX_TENSOR_NUMEL = 1048576
 
@@ -15,7 +15,7 @@ def get_iterable_path(iterable: IterableType, path: ObjPath) -> Any:
     return reduce(lambda a, idx: a[idx], path, iterable)  # type: ignore[index]
 
 
-def set_iterable_path(iterable: IterableType, path: Tuple[int, ...], val: Any):
+def set_iterable_path(iterable: IterableType, path: tuple[int, ...], val: Any):
     from .language import core
     assert len(path) != 0
     prev = iterable if len(path) == 1 else get_iterable_path(iterable, path[:-1])
@@ -27,9 +27,9 @@ def find_paths_if(iterable: Union[IterableType, Any], pred: Callable[[ObjPath, A
     from .language import core
     is_iterable: Callable[[Any], bool] = lambda x: isinstance(x, (list, tuple, core.tuple, core.tuple_type))
     # We need to use dict so that ordering is maintained, while set doesn't guarantee order
-    ret: Dict[ObjPath, None] = {}
+    ret: dict[ObjPath, None] = {}
 
-    def _impl(path: Tuple[int, ...], current: Any):
+    def _impl(path: tuple[int, ...], current: Any):
         if is_iterable(current):
             for idx, item in enumerate(current):
                 _impl((*path, idx), item)

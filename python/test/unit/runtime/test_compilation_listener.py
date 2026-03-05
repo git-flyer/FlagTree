@@ -5,7 +5,7 @@ from triton.backends.compiler import GPUTarget
 from triton.knobs import CompileTimes
 from triton.compiler.compiler import ASTSource, IRSource
 
-from typing import Any, Union, Tuple, Dict
+from typing import Any, Union
 
 import torch
 
@@ -18,9 +18,9 @@ def cumsum_kernel(ptr):
 
 
 def test_compile_stats(device: str, fresh_knobs_except_libraries: Any, fresh_triton_cache: str) -> None:
-    captured: Union[Tuple[Union[ASTSource, IRSource], Dict[str, Any], Dict[str, Any], CompileTimes, bool], None] = None
+    captured: Union[tuple[Union[ASTSource, IRSource], dict[str, Any], dict[str, Any], CompileTimes, bool], None] = None
 
-    def compile_listener(src: Union[ASTSource, IRSource], metadata: Dict[str, str], metadata_group: Dict[str, Any],
+    def compile_listener(src: Union[ASTSource, IRSource], metadata: dict[str, str], metadata_group: dict[str, Any],
                          times: CompileTimes, cache_hit: bool) -> None:
         nonlocal captured
         assert captured is None

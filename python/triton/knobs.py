@@ -9,7 +9,7 @@ import sysconfig
 
 from dataclasses import dataclass
 from contextlib import contextmanager
-from typing import cast, Any, Callable, Generator, Generic, List, Optional, Protocol, Type, TypeVar, TypedDict, TYPE_CHECKING, Union
+from typing import cast, Any, Callable, Generator, Generic, Optional, Protocol, Type, TypeVar, TypedDict, TYPE_CHECKING, Union
 
 from triton._C.libtriton import getenv, getenv_bool  # type: ignore
 
@@ -421,7 +421,7 @@ class HookChain(Generic[F]):
 
 # This is of the form [attr_name, attr_val]
 # TODO: Use tuple instead of list for better typing.
-KernelAttr = List[Union[str, int]]
+KernelAttr = list[Union[str, int]]
 
 
 class JITHookCompileInfo(TypedDict):
