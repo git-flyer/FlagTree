@@ -323,33 +323,31 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
 
     #def analyze_dot_dim(self, desc_block_shapes: Dict[str, List[str]]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
     def analyze_dot_dim(self, tma_map: Dict[str, Set[Tuple[str, ...]]]) -> Tuple[Dict[str, Set[str]], Dict[str, Set[str]]]:
-        # tma_map stores the non-trans block_shape per desc (already resolved).
-        # For each desc.load var, assign the tma_map block_shape;
-        # for tl.trans(src) vars, swap dims to get the logical shape after transpose.
-        desc_bs: Dict[str, List[str]] = {}
-        for desc_name, bs_set in tma_map.items():
-            if bs_set:
-                desc_bs[desc_name] = list(next(iter(bs_set)))
+        # tma_map already stores the canonical (non-trans) block_shape per desc,
+        # representing (M,K) or (K,N) in memory-layout order.
+        # Map each dot operand var back to its desc_name (through desc.load
+        # or tl.trans(desc.load result)), then read block_shape from tma_map.
 
-        raw_var_block_shapes: Dict[str, tuple] = {}
+        # var -> desc_name: direct desc.load assignments
+        var_to_desc: Dict[str, str] = {}
         for tma_info in self.tma_load_assignments:
-            target_var = tma_info['var_name']
-            desc_name = tma_info['desc_name']
-            raw_var_block_shapes[target_var] = (desc_name, list(desc_bs.get(desc_name) or []))
-
-        # var_block_shapes: swap last two dims of src's block shape if tl.trans(src)
-        var_block_shapes = dict[str, tuple](raw_var_block_shapes)
+            var_to_desc[tma_info['var_name']] = tma_info['desc_name']
+        # also trace through tl.trans(src) -> same desc
         for var_name, def_node in self.var_definitions.items():
             if isinstance(def_node, ast.Call) and self._is_tl_transpose(def_node) and def_node.args:
-                src_vars = VariableCollector.collect(def_node.args[0])
-                for src_var in src_vars:
-                    if src_var in raw_var_block_shapes:
-                        desc_name, src_block_shapes = raw_var_block_shapes[src_var]
-                        transposed = list(src_block_shapes)
-                        if len(transposed) >= 2:
-                            transposed[-1], transposed[-2] = transposed[-2], transposed[-1]
-                        var_block_shapes[var_name] = (desc_name, transposed)
+                for src_var in VariableCollector.collect(def_node.args[0]):
+                    if src_var in var_to_desc:
+                        var_to_desc[var_name] = var_to_desc[src_var]
                         break
+
+        def _get_desc_bs(var_node) -> Optional[Tuple[str, List[str]]]:
+            for v in VariableCollector.collect(var_node):
+                if v in var_to_desc:
+                    dn = var_to_desc[v]
+                    bs_set = tma_map.get(dn)
+                    if bs_set:
+                        return (dn, list(next(iter(bs_set))))
+            return None
 
         # tl.dot(a, b): a (M, K), b (K, N).
         bs_m_map: Dict[str, Set[str]] = {}
@@ -365,46 +363,36 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
             a_desc_name = None
             b_desc_name = None
 
-            # a: shape (M, K)
-            for a_var in VariableCollector.collect(args[0]):
-                if a_var in var_block_shapes:
-                    a_desc_name, a_block_shapes = var_block_shapes[a_var]
-                    if a_block_shapes:
-                        m_from_a = a_block_shapes[0]
-                        a_tensor_param_for_m = self._resolve_tensor_param(a_desc_name)
-                        if m_from_a is not None and a_tensor_param_for_m is not None:
-                            if m_from_a not in bs_m_map:
-                                bs_m_map[m_from_a] = set[str]()
-                            bs_m_map[m_from_a].add(a_tensor_param_for_m)
-                        k_from_a = a_block_shapes[-1]
-                    break
+            # a: shape (M, K) -> block_shape[0]=M, block_shape[-1]=K
+            a_info = _get_desc_bs(args[0])
+            if a_info:
+                a_desc_name, a_bs = a_info
+                if a_bs:
+                    m_from_a = a_bs[0]
+                    a_tensor_param_for_m = self._resolve_tensor_param(a_desc_name)
+                    if m_from_a is not None and a_tensor_param_for_m is not None:
+                        bs_m_map.setdefault(m_from_a, set()).add(a_tensor_param_for_m)
+                    k_from_a = a_bs[-1]
 
-            # b: shape (K, N)
-            for b_var in VariableCollector.collect(args[1]):
-                if b_var in var_block_shapes:
-                    b_desc_name, b_block_shapes = var_block_shapes[b_var]
-                    if b_block_shapes:
-                        k_from_b = b_block_shapes[0]
-                    break
+            # b: shape (K, N) -> block_shape[0]=K
+            b_info = _get_desc_bs(args[1])
+            if b_info:
+                b_desc_name, b_bs = b_info
+                if b_bs:
+                    k_from_b = b_bs[0]
 
-            # check K dim is consistent
             bs_k_name = k_from_a if k_from_a is not None else k_from_b
             if (k_from_a is not None and k_from_b is not None and k_from_a != k_from_b):
                 has_inconsistent = True
 
-            # Resolve desc names to real tensor param names
             a_tensor_param = self._resolve_tensor_param(a_desc_name)
             b_tensor_param = self._resolve_tensor_param(b_desc_name)
 
             if bs_k_name is not None:
                 if a_tensor_param is not None:
-                    if bs_k_name not in bs_k_map:
-                        bs_k_map[bs_k_name] = set[str]()
-                    bs_k_map[bs_k_name].add(a_tensor_param)
+                    bs_k_map.setdefault(bs_k_name, set()).add(a_tensor_param)
                 if b_tensor_param is not None:
-                    if bs_k_name not in bs_k_map:
-                        bs_k_map[bs_k_name] = set[str]()
-                    bs_k_map[bs_k_name].add(b_tensor_param)
+                    bs_k_map.setdefault(bs_k_name, set()).add(b_tensor_param)
 
         if has_inconsistent:
             return {}, {}
