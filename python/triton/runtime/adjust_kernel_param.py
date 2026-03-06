@@ -177,7 +177,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             if node.func.attr == 'load':
                 if isinstance(node.func.value, ast.Name):
-                    return node.func.value.id in ('tl', 'triton')
+                    return node.func.value.id in ('tl', 'language')
         return False
 
     # Return True if node is desc.load(...)
@@ -185,7 +185,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             if node.func.attr == 'load':
                 if isinstance(node.func.value, ast.Name):
-                    return node.func.value.id not in ('tl', 'triton')
+                    return node.func.value.id not in ('tl', 'language')
         return False
 
     # Return True if node is tl.make_tensor_descriptor(...)
@@ -193,7 +193,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             if node.func.attr == 'make_tensor_descriptor':
                 if isinstance(node.func.value, ast.Name):
-                    return node.func.value.id in ('tl', 'triton')
+                    return node.func.value.id in ('tl', 'language')
         return False
 
     # Return True if node is tl.trans(...)
@@ -201,7 +201,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         if isinstance(node.func, ast.Attribute):
             if node.func.attr == 'trans':
                 if isinstance(node.func.value, ast.Name):
-                    return node.func.value.id in ('tl', 'triton')
+                    return node.func.value.id in ('tl', 'language')
         return False
 
     # Resolve a symbol (e.g. a local TMA desc var) to its underlying tensor input param
@@ -537,6 +537,8 @@ def analyze_kernel_dependencies(jit_fn, pre_hook_fn: Optional[object] = None) ->
                 )
                 for desc_name, bs_names_set in tma_map.items():
                     print(f"  tma_map[desc_name, set[block_shapes]]: '{desc_name}' -> {bs_names_set}")
+                for desc_name, block_shapes in desc_block_shapes.items():
+                    print(f"  desc_block_shapes[desc_name, list[block_shape]]: '{desc_name}' -> {block_shapes}")
             if bs_m_map or bs_k_map:
                 print(f"\n=== FlagTree adjust_kernel_param tl.dot: {getattr(jit_fn, '__name__', 'unknown')} ===")
                 print(f"  bs_m_map[bs_name, set[param_name]]: {bs_m_map}")
