@@ -4,5 +4,6 @@ add_triton_library(TleToLLVM
     PackOpToLLVM.cpp
 
     DEPENDS
+    TleTableGen
     TritonGPUTypeInterfacesIncGen
 )

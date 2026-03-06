@@ -1,6 +1,14 @@
 # For Triton
 
 # ######################################################
+# Parallel jobs for nested cmake --build; use env MAX_JOBS when set, else default -j4
+if(DEFINED ENV{MAX_JOBS} AND NOT "$ENV{MAX_JOBS}" STREQUAL "")
+  set(JOB_SETTING "-j$ENV{MAX_JOBS}")
+else()
+  set(JOB_SETTING "-j4")
+endif()
+
+# ######################################################
 # Get LLVM for triton
 include(triton_gcu_llvm)
 include(triton_gcu_llvm_config)
