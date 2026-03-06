@@ -262,7 +262,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         for def_node in self.var_all_definitions.get(var_name, []):
             ret.update(self._extract_arange_bs(def_node))
             for child_var in VariableCollector.collect(def_node):
-                if child_var != var_name and not child_var.startswith('pid'):
+                if child_var != var_name and child_var not in self.input_params and child_var not in self.constexpr_params:
                     ret.update(self._extract_arange_bs_recursive(child_var, visited.copy()))
         return ret
 
@@ -488,13 +488,14 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                 transpose_used_vars.add(v)
                 transpose_used_vars.update(self._get_dependencies_vars(v))
 
+        # Only add the canonical (non-transposed) block shape for each descriptor.
         tma_map: Dict[str, Set[Tuple[str, ...]]] = {}
         for tma_info in self.tma_load_assignments:
             desc_name = tma_info["desc_name"]
             target_var = tma_info["var_name"]
+            if target_var in transpose_used_vars:
+                continue
             block_shape = list[str](desc_block_shapes.get(desc_name) or [])
-            if target_var in transpose_used_vars and len(block_shape) >= 2:
-                block_shape[-1], block_shape[-2] = block_shape[-2], block_shape[-1]
             if block_shape:
                 tma_map.setdefault(desc_name, set()).add(tuple(block_shape))
         return tma_map, desc_block_shapes
