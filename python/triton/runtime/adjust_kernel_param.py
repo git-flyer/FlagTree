@@ -737,22 +737,22 @@ def auto_adjust_block_sizes(nargs, fn, configs, current, config):
     pre_hook_fn = getattr(config, "pre_hook", None) or (configs[0].pre_hook if configs else None)
     load_map, tma_map, bs_m_map, bs_k_map = analyze_kernel_dependencies(fn, pre_hook_fn=pre_hook_fn)
 
-    if load_map:
+    if load_map:  # tl.load or tma_device.load
         if knobs.autotuning.print:
-            print("[AABS] 1. adjust bs in tl_load")
+            print("[AABS] 1. adjust bs in tl.load or tma_device.load")
         for bs_name, ts_name in load_map.items():
             adjust_block_size_tl_load(nargs, current, config, bs_name, ts_name)
 
-    if tma_map:
+    if tma_map:  # tma_host.load
         if knobs.autotuning.print:
-            print("[AABS] 2. adjust bs in tma")
+            print("[AABS] 2. adjust bs in tma_host.load")
         for desc_name, bs_names_set in tma_map.items():
             for bs_names in bs_names_set:
                 adjust_block_size_tma(nargs, current, config, desc_name, bs_names)
 
-    if bs_k_map or bs_m_map:
+    if bs_k_map or bs_m_map:  # tl.dot with tma_device or tma_host
         if knobs.autotuning.print:
-            print("[AABS] 3. adjust bs in tl.dot")
+            print("[AABS] 3. adjust bs in tl.dot with tma_device or tma_host")
         adjust_block_size_dot_k_dim(nargs, current, config, bs_k_map, 16)
         adjust_block_size_dot_m_dim(nargs, current, config, bs_k_map, bs_m_map, 128)
 
