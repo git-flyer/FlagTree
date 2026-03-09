@@ -7,7 +7,7 @@ Flagtree Third Party Backend for Enflame accelerators, including core component 
 ## Prerequisites
 
 - Linux host system with Docker support
-- Enflame 3rd Generation Accelerator Card (S60)
+- Enflame 3rd/4th Generation Accelerator Card
 - Minimum 16GB RAM (32GB recommended)
 - 100GB available disk space
 
@@ -41,11 +41,7 @@ docker load -i enflame-flagtree-0.4.0.tar.gz
 # docker rm -f enflame-flagtree
 
 # Assuming flagtree source code is located at ~/flagtree
-docker run -itd \
-  --privileged \
-  --name enflame-flagtree \
-  -v ~/flagtree:/root/flagtree \
-  enflame/flagtree:0.4.0 bash
+docker run -itd --privileged --name enflame-flagtree -v ~/flagtree:/root/flagtree enflame/flagtree:0.4.0 bash
 ```
 
 ### 4. Install Driver
@@ -54,9 +50,9 @@ docker run -itd \
 # Extract and install Enflame driver
 docker cp enflame-flagtree:/enflame enflame
 
-sudo bash enflame/driver/enflame-x86_64-gcc-1.6.3.12-20260215104629.run
+sudo bash enflame/driver/enflame-x86_64-gcc-*.run
 # Use other arguments if prompt, e.g.
-# sudo bash enflame/driver/enflame-x86_64-gcc-1.6.3.12-20260215104629.run --virt-host
+# sudo bash enflame/driver/enflame-x86_64-gcc-*.run --virt-host
 
 efsmi
 ```
@@ -66,20 +62,17 @@ Check driver status with efsmi. Example output:
 ```
 -------------------------------------------------------------------------------
 --------------------- Enflame System Management Interface ---------------------
---------- Enflame Tech, All Rights Reserved. 2024-2025 Copyright (C) ----------
+--------- Enflame Tech, All Rights Reserved. 2024-2026 Copyright (C) ----------
 -------------------------------------------------------------------------------
 
-+2025-11-28, 10:50:14 CST-----------------------------------------------------+
-| EFSMI: 1.6.3.12          Driver Ver: 1.6.3.12                               |
++2026-03-06, 10:12:03 CST-----------------------------------------------------+
+| EFSMI: 1.7.2.14          Driver Ver: 1.7.2.14                               |
 +-----------------------------+-------------------+---------------------------+
-| DEV    NAME                 | FW VER            | BUS-ID      ECC           |
+| DEV    NAME                 | Boot FW VER       | BUS-ID      ECC           |
 | TEMP   Lpm   Pwr(Usage/Cap) | Mem      GCU Virt | DUsed       SN            |
 |=============================================================================|
-| 0      Enflame S60G         | 31.5.3            | 00:2e:00.0  Disable       |
-| 34℃    LP0      N/A         | 23552MiB  SRIOV   | 0%          A018K30520031 |
-+-----------------------------+-------------------+---------------------------+
-| 1      Enflame S60G         | 31.5.3            | 00:2f:00.0  Disable       |
-| 34℃    LP0      N/A         | 23552MiB  SRIOV   | 0%          A018K30520031 |
+| 0      Enflame L300         | 40.2.8.3          | 00:2d:00.0  Enable        |
+| 35¡æ    LP1      68W / 300W  | 147456MiB Disable | 0%          A098Q50610048 |
 +-----------------------------+-------------------+---------------------------+
 ```
 
@@ -116,19 +109,19 @@ git config --global --add safe.directory ~/flagtree
 
 ```bash
 cd ~/flagtree/python
-pip3 install -r requirements.txt
+pip3 install -r requirements.txt --break-system-packages
 ```
 
 ### 4. Build and Install Package
 
 ```bash
-cd ~/flagtree/python
+cd ~/flagtree
 
 # Initial build
-pip3 install . --no-build-isolation -v
+pip3 install . --no-build-isolation -v --break-system-packages
 
 # Rebuild after code modification
-pip3 install . --no-build-isolation --force-reinstall -v
+pip3 install . --no-build-isolation --force-reinstall -v --break-system-packages
 ```
 
 ## Test Validation
