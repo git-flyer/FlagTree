@@ -9,6 +9,7 @@ python_dir = current_dir.parent.parent
 sys.path.insert(0, str(python_dir))
 from build_helpers import get_cmake_dir
 
+
 def get_package_data_tools():
     """Declare tool files to be packaged"""
     return ["triton-gcu300-opt", "triton-gcu400-opt"]
