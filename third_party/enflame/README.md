@@ -18,8 +18,8 @@ Flagtree Third Party Backend for Enflame accelerators, including core component 
 ```bash
 # Pull code and switch to triton_v3.5.x branch
 cd ~
-git clone https://github.com/flagos-ai/flagtree.git
-cd flagtree
+git clone https://github.com/flagos-ai/FlagTree.git
+cd FlagTree
 git checkout -b triton_v3.5.x origin/triton_v3.5.x
 ```
 
@@ -41,7 +41,7 @@ docker load -i enflame-flagtree-0.4.0.tar.gz
 # docker rm -f enflame-flagtree
 
 # Assuming flagtree source code is located at ~/flagtree
-docker run -itd --privileged --name enflame-flagtree -v ~/flagtree:/root/flagtree enflame/flagtree:0.4.0 bash
+docker run -itd --privileged --name enflame-flagtree -v ~/FlagTree:/root/FlagTree enflame/flagtree:0.4.0 bash
 ```
 
 ### 4. Install Driver
@@ -72,7 +72,7 @@ Check driver status with efsmi. Example output:
 | TEMP   Lpm   Pwr(Usage/Cap) | Mem      GCU Virt | DUsed       SN            |
 |=============================================================================|
 | 0      Enflame L300         | 40.2.8.3          | 00:2d:00.0  Enable        |
-| 35¡æ    LP1      68W / 300W  | 147456MiB Disable | 0%          A098Q50610048 |
+| 35℃    LP1      68W / 300W  | 147456MiB Disable | 0%          A098Q50610048 |
 +-----------------------------+-------------------+---------------------------+
 ```
 
@@ -102,20 +102,20 @@ tar -xzf enflame-llvm22-189e06b-gcc9-x64_v0.4.0.tar.gz
 
 ```bash
 export FLAGTREE_BACKEND=enflame
-git config --global --add safe.directory ~/flagtree
+git config --global --add safe.directory ~/FlagTree
 ```
 
 ### 3. Install Python Dependencies
 
 ```bash
-cd ~/flagtree/python
+cd ~/FlagTree/python
 pip3 install -r requirements.txt --break-system-packages
 ```
 
 ### 4. Build and Install Package
 
 ```bash
-cd ~/flagtree
+cd ~/FlagTree
 
 # Initial build
 pip3 install . --no-build-isolation -v --break-system-packages
@@ -128,6 +128,6 @@ pip3 install . --no-build-isolation --force-reinstall -v --break-system-packages
 
 ```bash
 # Run unit tests
-cd ~/flagtree
+cd ~/FlagTree
 pytest third_party/enflame/python/test/unit
 ```
