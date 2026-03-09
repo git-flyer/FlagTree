@@ -7,7 +7,7 @@ from pathlib import Path
 current_dir = Path(__file__).parent
 python_dir = current_dir.parent.parent
 sys.path.insert(0, str(python_dir))
-from build_helpers import get_cmake_dir
+from build_helpers import get_cmake_dir # noqa: E402
 
 
 def get_package_data_tools():
