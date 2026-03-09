@@ -3,12 +3,6 @@ import shutil
 import sys
 from pathlib import Path
 
-# Add parent directories to path to import build_helpers
-current_dir = Path(__file__).parent
-python_dir = current_dir.parent.parent
-sys.path.insert(0, str(python_dir))
-from build_helpers import get_cmake_dir  # noqa: E402
-
 
 def get_package_data_tools():
     """Declare tool files to be packaged"""
@@ -17,6 +11,11 @@ def get_package_data_tools():
 
 def install_extension(*args, **kargs):
     """Copy triton-gcu400-opt to third_party/enflame/backend directory"""
+    # Lazy import: build_helpers lives in python/, so add it to path first
+    _python_dir = Path(__file__).parent.parent.parent
+    if str(_python_dir) not in sys.path:
+        sys.path.insert(0, str(_python_dir))
+    from build_helpers import get_cmake_dir
     # Get CMake build directory using the same function as setup.py
     # This returns build/cmake.linux-x86_64-cpython-3.10, not build/temp.*
     cmake_dir = get_cmake_dir()
