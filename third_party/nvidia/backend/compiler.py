@@ -387,6 +387,8 @@ class CUDABackend(BaseBackend):
 
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
+        # flagtree tle raw
+        tle.raw_passes.add_tle_dsl_region_inline(pm)
 
         pm.run(mod, 'make_llir')
 
