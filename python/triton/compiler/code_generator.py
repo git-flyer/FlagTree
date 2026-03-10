@@ -15,7 +15,6 @@ from ..runtime.jit import _normalize_ty, get_jit_fn_file_line
 from ..runtime import JITFunction
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
 from types import ModuleType
-from .hint_manager import hint_trigger
 
 
 def mangle_ty(ty):
