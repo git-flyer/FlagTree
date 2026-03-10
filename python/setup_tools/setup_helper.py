@@ -409,7 +409,8 @@ cache.store(
 cache.store(
     file="XTDK-llvm19-ubuntu2004_x86_64",
     condition=("xpu" == flagtree_backend),
-    url="https://baai-cp-web.ks3-cn-beijing.ksyuncs.com/trans/XTDK-llvm19-ubuntu2004_x86_64_v0.3.0.tar.gz",
+    url=
+    "https://klx-sdk-release-public.su.bcebos.com/v1/triton/flaggems/2025_4_season/llvm/20260304/XTDK-llvm19-ubuntu2004_x86_64.tar.gz",
     pre_hock=lambda: check_env('LLVM_SYSPATH'),
     post_hock=set_llvm_env,
 )
