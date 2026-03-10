@@ -56,8 +56,8 @@ jobs:
         shell: bash
         run: |
           set -x
-          pip uninstall -y triton
-          pip uninstall -y triton_gcu
+          python3 -m pip uninstall -y triton --break-system-packages
+          python3 -m pip uninstall -y triton_gcu --break-system-packages
           export FLAGTREE_BACKEND=enflame
           MAX_JOBS=32 python3 -m pip install . --no-build-isolation --break-system-packages
 
