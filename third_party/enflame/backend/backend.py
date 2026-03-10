@@ -23,7 +23,6 @@ import hashlib
 import setuptools
 from setuptools import Extension
 
-import torch
 from triton.backends.enflame.toolkit import *
 from triton.backends.enflame.filecache import get_cache_manager
 

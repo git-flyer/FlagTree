@@ -13,15 +13,4 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-#import triton_gcu.triton.libdevice
-try:
-    import torch_gcu
-except ImportError:
-    pass
 
-# append gcu backend and driver
-#from triton.backends import Backend, backends
-#from triton_gcu.triton.compiler import _GCUBackend
-#from triton_gcu.triton.driver import _GCUDriver
-#backends.clear()
-#backends["gcu"] = Backend(_GCUBackend, _GCUDriver)
