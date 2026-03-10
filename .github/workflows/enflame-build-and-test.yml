@@ -59,7 +59,7 @@ jobs:
           pip uninstall -y triton
           pip uninstall -y triton_gcu
           export FLAGTREE_BACKEND=enflame
-          MAX_JOBS=32 python3 -m pip install . --no-build-isolation
+          MAX_JOBS=32 python3 -m pip install . --no-build-isolation --break-system-packages
 
       - name: FlagTree Test on Enflame
         shell: bash
