@@ -2,8 +2,11 @@
 add_triton_library(TritonTLETransforms
   TleEarlyAssignMemorySpace.cpp
   TleLowerAsyncLoad.cpp
+  TleTileToLLVMUtils.cpp
   ExtractTileToLLVM.cpp
+  InsertTileToLLVM.cpp
   TleLowerExtractTile.cpp
+  TleLowerInsertTile.cpp
   TleLowerTmaCopy.cpp
   ConvertArgToMemDesc.cpp
   DSLRegionInline.cpp

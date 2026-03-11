@@ -7,5 +7,5 @@ __all__ = [
 ]
 
 from . import gpu, raw
-from .gpu import extract_tile
-__all__ = ['gpu', 'extract_tile']
+from .gpu import extract_tile, insert_tile
+__all__ = ['gpu', 'extract_tile', 'insert_tile']
