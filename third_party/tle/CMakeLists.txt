@@ -12,7 +12,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     MLIRTargetLLVMIRImport
     TritonTLETransforms
     TritonIR)
-  target_link_libraries(TritonTLE PRIVATE Python3::Module pybind11::headers MLIRTargetLLVMIRImport)
+  target_link_libraries(TritonTLE PRIVATE Python3::Module pybind11::headers)
 endif()
 
 add_subdirectory(test)
