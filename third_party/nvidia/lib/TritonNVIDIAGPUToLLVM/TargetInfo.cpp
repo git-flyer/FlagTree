@@ -28,8 +28,8 @@ LLVM::LLVMFuncOp getVprintfDeclaration(RewriterBase &rewriter) {
   RewriterBase::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(moduleOp.getBody());
 
-  return LLVM::LLVMFuncOp::create(rewriter, UnknownLoc::get(context), funcName,
-                                  funcType);
+  return rewriter.create<LLVM::LLVMFuncOp>(UnknownLoc::get(context), funcName,
+                                           funcType);
 }
 
 // extend integer to int32, extend float to float64
@@ -74,8 +74,8 @@ LLVM::LLVMFuncOp getAssertfailDeclaration(RewriterBase &rewriter) {
   auto funcType = LLVM::LLVMFunctionType::get(void_ty(ctx), argsType);
   RewriterBase::InsertionGuard guard(rewriter);
   rewriter.setInsertionPointToStart(moduleOp.getBody());
-  auto funcOp = LLVM::LLVMFuncOp::create(rewriter, UnknownLoc::get(ctx),
-                                         funcName, funcType);
+  auto funcOp = rewriter.create<LLVM::LLVMFuncOp>(UnknownLoc::get(ctx),
+                                                  funcName, funcType);
 
   funcOp.setPassthroughAttr(
       ArrayAttr::get(ctx, StringAttr::get(ctx, "noreturn")));
@@ -130,23 +130,23 @@ bool TargetInfo::supportMaximumMinimum() const {
 }
 
 Value TargetInfo::getClusterCTAId(RewriterBase &rewriter, Location loc) const {
-  return triton::nvgpu::ClusterCTAIdOp::create(rewriter, loc,
-                                               rewriter.getI32Type());
+  return rewriter.create<triton::nvgpu::ClusterCTAIdOp>(loc,
+                                                        rewriter.getI32Type());
 }
 
 Value TargetInfo::ballot(RewriterBase &rewriter, Location loc, Type type,
                          Value cmp) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   Value threadMask = b.int_val(type.getIntOrFloatBitWidth(), -1);
-  return NVVM::VoteSyncOp::create(rewriter, loc, type, threadMask, cmp,
-                                  NVVM::VoteSyncKind::ballot);
+  return rewriter.create<NVVM::VoteSyncOp>(loc, type, threadMask, cmp,
+                                           NVVM::VoteSyncKind::ballot);
 }
 
 void TargetInfo::barrier(Location loc, RewriterBase &rewriter,
                          bool isWarpSync) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   if (isWarpSync) {
-    NVVM::SyncWarpOp::create(rewriter, loc, b.i32_val(0xffffffff));
+    rewriter.create<NVVM::SyncWarpOp>(loc, b.i32_val(0xffffffff));
   } else {
     b.barrier();
   }
@@ -157,11 +157,10 @@ static Value mapa(RewriterBase &rewriter, Location loc, Value ptr, Value ctaid,
 #ifdef __TLE__
   (void)pred;
   auto clusterPtrTy = LLVM::LLVMPointerType::get(
-      rewriter.getContext(),
-      static_cast<unsigned>(NVVM::NVVMMemorySpace::SharedCluster));
-  return NVVM::MapaOp::create(rewriter, loc, clusterPtrTy, ptr, ctaid);
+      rewriter.getContext(), NVVM::NVVMMemorySpace::kSharedClusterMemorySpace);
+  return rewriter.create<NVVM::MapaOp>(loc, clusterPtrTy, ptr, ctaid);
 #else
-  return NVVM::MapaOp::create(rewriter, loc, ptr.getType(), ptr, ctaid);
+  return rewriter.create<NVVM::MapaOp>(loc, ptr.getType(), ptr, ctaid);
 #endif
 }
 
@@ -171,11 +170,11 @@ Value TargetInfo::mapSharedToClusterPointer(RewriterBase &rewriter,
                                             Value ctaId) const {
   auto ptrTy = cast<LLVM::LLVMPointerType>(ptr.getType());
   if (ptrTy.getAddressSpace() ==
-      static_cast<unsigned>(NVVM::NVVMMemorySpace::SharedCluster))
+      static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedClusterMemorySpace))
     return ptr;
   assert(
       ptrTy.getAddressSpace() ==
-          static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared) &&
+          static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedMemorySpace) &&
       "mapSharedToClusterPointer requires shared or cluster shared pointers");
   return mapa(rewriter, loc, ptr, ctaId, Value());
 }
@@ -211,10 +210,10 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
 #ifdef __TLE__
   const bool isShared =
       ptrTy.getAddressSpace() ==
-      static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared);
+      static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedMemorySpace);
   const bool isClusterShared =
       ptrTy.getAddressSpace() ==
-      static_cast<unsigned>(NVVM::NVVMMemorySpace::SharedCluster);
+      static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedClusterMemorySpace);
   assert((isShared || isClusterShared) && "Invalid addr space for store_dsmem");
   const bool useCluster = ctaId.has_value() || isClusterShared;
 #else
@@ -230,7 +229,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   auto vecTy = cast<VectorType>(val.getType());
   Type elemTy = vecTy.getElementType();
   unsigned vec = vecTy.getNumElements();
-  unsigned elemBitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
+  unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
   assert(llvm::isPowerOf2_32(vec));
 
   if (elemBitwidth < 8) {
@@ -248,11 +247,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   if (!elemTy.isInteger()) {
     SmallVector<Value> vals = unpackLLVector(loc, val, rewriter);
     for (Value &v : vals) {
-      if (isa<LLVM::LLVMPointerType>(v.getType())) {
-        v = b.ptrtoint(int_ty(elemBitwidth), v);
-      } else {
-        v = b.bitcast(v, int_ty(elemBitwidth));
-      }
+      v = b.bitcast(v, int_ty(elemBitwidth));
     }
     storeDShared(rewriter, loc, ptr, ctaId, packLLVector(loc, vals, rewriter),
                  pred);
@@ -330,7 +325,7 @@ void TargetInfo::storeDShared(RewriterBase &rewriter, Location loc, Value ptr,
   }
 
   PTXBuilder builder;
-  auto st = builder.create("st")
+  auto st = builder.create<>("st")
                 ->o("shared::cta", ctaId.has_value())
                 .o("shared", !ctaId.has_value())
                 .v(vec, /*predicate=*/vec > 1)
@@ -366,10 +361,10 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
 #ifdef __TLE__
   const bool isShared =
       ptrTy.getAddressSpace() ==
-      static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared);
+      static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedMemorySpace);
   const bool isClusterShared =
       ptrTy.getAddressSpace() ==
-      static_cast<unsigned>(NVVM::NVVMMemorySpace::SharedCluster);
+      static_cast<unsigned>(NVVM::NVVMMemorySpace::kSharedClusterMemorySpace);
   assert((isShared || isClusterShared) && "Invalid addr space for load_dsmem");
   const bool useCluster = ctaId.has_value() || isClusterShared;
 #else
@@ -387,7 +382,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   auto vecTy = cast<VectorType>(loadTy);
   Type elemTy = vecTy.getElementType();
   unsigned vec = vecTy.getNumElements();
-  unsigned elemBitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
+  unsigned elemBitwidth = elemTy.getIntOrFloatBitWidth();
   assert(llvm::isPowerOf2_32(vec));
 
   if (elemBitwidth < 8) {
@@ -471,7 +466,7 @@ Value TargetInfo::loadDShared(RewriterBase &rewriter, Location loc, Value ptr,
   }
 
   PTXBuilder builder;
-  auto ld = builder.create("ld")
+  auto ld = builder.create<>("ld")
                 ->o("shared::cta", ctaId.has_value())
                 .o("shared", !ctaId.has_value())
                 .v(vec, /*predicate=*/vec > 1)
@@ -597,9 +592,9 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
               acc[i] = b.zext(i32_ty, acc[i]);
           }
         }
-        acc[i] = NVVM::ReduxOp::create(rewriter, loc, acc[i].getType(), acc[0],
-                                       *kind, mask, /*abs=*/false,
-                                       /*nan=*/useNanQualifier);
+        acc[i] = rewriter.create<NVVM::ReduxOp>(loc, acc[i].getType(), acc[0],
+                                                *kind, mask, /*abs=*/false,
+                                                /*nan=*/useNanQualifier);
         if (acc[i].getType().isInteger()) {
           if (bitwidth < 32)
             acc[i] = b.trunc(int_ty(bitwidth), acc[i]);
@@ -646,8 +641,8 @@ void TargetInfo::printf(RewriterBase &rewriter, Value formatStrStart,
 
     Type structTy = LLVM::LLVMStructType::getLiteral(ctx, argTypes);
     auto allocated =
-        LLVM::AllocaOp::create(rewriter, loc, ptr_ty(ctx), structTy, one,
-                               /*alignment=*/0);
+        rewriter.create<LLVM::AllocaOp>(loc, ptr_ty(ctx), structTy, one,
+                                        /*alignment=*/0);
 
     for (const auto &entry : llvm::enumerate(newArgs)) {
       auto index = b.i32_val(entry.index());

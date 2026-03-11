@@ -1,4 +1,5 @@
 import functools
+import operator
 import os
 import subprocess
 import triton
@@ -13,16 +14,8 @@ from triton.backends.driver import GPUDriver
 dirname = os.path.dirname(os.path.realpath(__file__))
 include_dirs = [os.path.join(dirname, "include")]
 libdevice_dir = os.path.join(dirname, "lib")
-libraries = ['libcuda.so.1']
+libraries = ['cuda']
 PyCUtensorMap = None
-
-
-def _is_tle_enabled():
-    try:
-        import triton._C.libtriton as libtriton
-        return hasattr(libtriton, "tle")
-    except Exception:
-        return False
 
 
 @functools.lru_cache()
@@ -268,7 +261,6 @@ def make_launcher(constants, signature, tensordesc_meta):
     params = [f"&arg{i}" for i, ty in signature.items() if ty != "constexpr"]
     params.append("&global_scratch")
     params.append("&profile_scratch")
-    tle_cpp_define = "#define __TLE__ 1" if _is_tle_enabled() else ""
     src = f"""
 #include \"cuda.h\"
 #include <dlfcn.h>
@@ -276,7 +268,6 @@ def make_launcher(constants, signature, tensordesc_meta):
 #include <stdlib.h>
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-{tle_cpp_define}
 
 typedef struct {{
   PyObject_HEAD;
@@ -323,13 +314,14 @@ static cuLaunchKernelEx_t getLaunchKernelExHandle() {{
   return cuLaunchKernelExHandle;
 }}
 
-#ifdef __TLE__
-static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int clusterDimX, int clusterDimY, int clusterDimZ, int launch_cooperative_grid, int launch_pdl, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
+static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_pdl, int clusterDimX, int clusterDimY, int clusterDimZ, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
   (void)num_ctas;
   void *params[] = {{ {', '.join(params)} }};
   if (gridX*gridY*gridZ > 0) {{
+    // begin flagtree tle
     int cluster_size = clusterDimX * clusterDimY * clusterDimZ;
     bool use_cluster_launch = cluster_size != 1;
+    // end flagtree tle
     // 4 attributes that we can currently pass maximum
     CUlaunchAttribute launchAttr[4];
     static cuLaunchKernelEx_t cuLaunchKernelExHandle = NULL;
@@ -337,14 +329,18 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       cuLaunchKernelExHandle = getLaunchKernelExHandle();
     }}
     CUlaunchConfig config;
-    config.gridDimX = gridX * num_ctas;
+    config.gridDimX = gridX;
     config.gridDimY = gridY;
     config.gridDimZ = gridZ;
+
+    // begin flagtree tle
     if (use_cluster_launch) {{
       config.gridDimX *= clusterDimX;
       config.gridDimY *= clusterDimY;
       config.gridDimZ *= clusterDimZ;
     }}
+    // end flagtree tle
+
     config.blockDimX = 32 * num_warps;
     config.blockDimY = 1;
     config.blockDimZ = 1;
@@ -365,6 +361,7 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       ++num_attrs;
     }}
 
+    // begin flagtree tle
     if (use_cluster_launch) {{
       CUlaunchAttribute clusterAttr = {{}};
       clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
@@ -380,85 +377,13 @@ static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas
       launchAttr[num_attrs] = clusterSchedulingAttr;
       ++num_attrs;
     }}
+    // end flagtree tle
 
-    // Cluster size 16 is non-portable. Does work for H100 and B200 tho.
     config.numAttrs = num_attrs;
-    if (num_ctas == 16 || cluster_size == 16) {{
-      CUDA_CHECK(cuFuncSetAttribute(
-          function,
-          CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
-          1
-      ));
-    }}
 
     CUDA_CHECK(cuLaunchKernelExHandle(&config, function, params, 0));
   }}
 }}
-#else
-static void _launch(int gridX, int gridY, int gridZ, int num_warps, int num_ctas, int launch_cooperative_grid, int launch_pdl, int shared_memory, CUstream stream, CUfunction function, CUdeviceptr global_scratch, CUdeviceptr profile_scratch{', ' + arg_decls if len(arg_decls) > 0 else ''}) {{
-  void *params[] = {{ {', '.join(params)} }};
-  if (gridX*gridY*gridZ > 0) {{
-    // 4 attributes that we can currently pass maximum
-    CUlaunchAttribute launchAttr[4];
-    static cuLaunchKernelEx_t cuLaunchKernelExHandle = NULL;
-    if (cuLaunchKernelExHandle == NULL) {{
-      cuLaunchKernelExHandle = getLaunchKernelExHandle();
-    }}
-    CUlaunchConfig config;
-    config.gridDimX = gridX * num_ctas;
-    config.gridDimY = gridY;
-    config.gridDimZ = gridZ;
-
-    config.blockDimX = 32 * num_warps;
-    config.blockDimY = 1;
-    config.blockDimZ = 1;
-    config.sharedMemBytes = shared_memory;
-    config.hStream = stream;
-    config.attrs = launchAttr;
-    int num_attrs = 0;
-
-    if (launch_pdl != 0) {{
-      CUlaunchAttribute pdlAttr = {{ .id = CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION, .value = 1}};
-      launchAttr[num_attrs] = pdlAttr;
-      ++num_attrs;
-    }}
-
-    if (launch_cooperative_grid != 0) {{
-      CUlaunchAttribute coopAttr = {{ .id = CU_LAUNCH_ATTRIBUTE_COOPERATIVE, .value = 1}};
-      launchAttr[num_attrs] = coopAttr;
-      ++num_attrs;
-    }}
-
-    if (num_ctas != 1) {{
-      CUlaunchAttribute clusterAttr = {{}};
-      clusterAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
-      clusterAttr.value.clusterDim.x = num_ctas;
-      clusterAttr.value.clusterDim.y = 1;
-      clusterAttr.value.clusterDim.z = 1;
-      launchAttr[num_attrs] = clusterAttr;
-      ++num_attrs;
-
-      CUlaunchAttribute clusterSchedulingAttr = {{}};
-      clusterSchedulingAttr.id = CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE;
-      clusterSchedulingAttr.value.clusterSchedulingPolicyPreference = CU_CLUSTER_SCHEDULING_POLICY_SPREAD;
-      launchAttr[num_attrs] = clusterSchedulingAttr;
-      ++num_attrs;
-    }}
-
-    // num_ctas == 16 is non-portable. Does work for H100 and B200 tho
-    config.numAttrs = num_attrs;
-    if (num_ctas == 16) {{
-      CUDA_CHECK(cuFuncSetAttribute(
-          function,
-          CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
-          1
-      ));
-    }}
-
-    CUDA_CHECK(cuLaunchKernelExHandle(&config, function, params, 0));
-  }}
-}}
-#endif
 
 typedef struct _DevicePtrInfo {{
     CUdeviceptr dev_ptr;
@@ -592,41 +517,11 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     return NULL;
   }}
 
-  int num_warps, num_ctas, shared_memory;
-#ifdef __TLE__
-  int clusterDimX = 1, clusterDimY = 1, clusterDimZ = 1;
-  if (!PyTuple_Check(kernel_metadata)) {{
+  int num_warps, num_ctas, shared_memory, clusterDimX, clusterDimY, clusterDimZ;
+  if (!PyArg_ParseTuple(kernel_metadata, \"iiiiii\", &num_warps, &num_ctas, &shared_memory, &clusterDimX, &clusterDimY, &clusterDimZ)) {{
     PyErr_SetString(PyExc_TypeError, "kernel_metadata must be a tuple");
     return NULL;
   }}
-  Py_ssize_t kernel_metadata_size = PyTuple_Size(kernel_metadata);
-  if (kernel_metadata_size == 3) {{
-    if (!PyArg_ParseTuple(kernel_metadata, \"iii\", &num_warps, &num_ctas, &shared_memory)) {{
-      PyErr_SetString(PyExc_TypeError, "kernel_metadata must be (num_warps, num_ctas, shared_memory)");
-      return NULL;
-    }}
-  }} else if (kernel_metadata_size == 6) {{
-    if (!PyArg_ParseTuple(kernel_metadata, \"iiiiii\", &num_warps, &num_ctas, &shared_memory,
-                          &clusterDimX, &clusterDimY, &clusterDimZ)) {{
-      PyErr_SetString(PyExc_TypeError,
-                      "kernel_metadata must be (num_warps, num_ctas, shared_memory, clusterDimX, clusterDimY, clusterDimZ)");
-      return NULL;
-    }}
-  }} else {{
-    PyErr_SetString(PyExc_TypeError,
-                    "kernel_metadata must contain 3 or 6 integers");
-    return NULL;
-  }}
-  if (clusterDimX <= 0 || clusterDimY <= 0 || clusterDimZ <= 0) {{
-    PyErr_SetString(PyExc_ValueError, "cluster dims must be positive");
-    return NULL;
-  }}
-#else
-  if (!PyArg_ParseTuple(kernel_metadata, \"iii\", &num_warps, &num_ctas, &shared_memory)) {{
-    PyErr_SetString(PyExc_TypeError, "kernel_metadata must be a tuple");
-    return NULL;
-  }}
-#endif
 
   // extract launch metadata
   if (launch_enter_hook != Py_None){{
@@ -659,11 +554,7 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   {newline.join(tma_decls)}
   {newline.join(float_storage_decls)}
   Py_BEGIN_ALLOW_THREADS;
-#ifdef __TLE__
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, clusterDimX, clusterDimY, clusterDimZ, launch_cooperative_grid, launch_pdl, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
-#else
-  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_pdl, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
-#endif
+  _launch(gridX, gridY, gridZ, num_warps, num_ctas, launch_cooperative_grid, launch_pdl, clusterDimX, clusterDimY, clusterDimZ, shared_memory, (CUstream)_stream, (CUfunction)_function, global_scratch, profile_scratch{', ' + ', '.join(internal_args_list) if len(internal_args_list) > 0 else ''});
   Py_END_ALLOW_THREADS;
   if (PyErr_Occurred()) {{
     return NULL;
@@ -805,7 +696,7 @@ class CudaLauncher(object):
             libraries=libraries,
         )
 
-        self.num_ctas = getattr(metadata, "num_ctas", 1)
+        self.num_ctas = functools.reduce(operator.mul, metadata.cluster_dims, 1)
         self.launch = wrap_handle_tensordesc(mod.launch, signature, tensordesc_meta)
         self.global_scratch_size = metadata.global_scratch_size
         self.global_scratch_align = metadata.global_scratch_align
@@ -830,7 +721,7 @@ class CudaLauncher(object):
         # counter protocol, which assumes a well-defined initial counter state.
         # Runtime scratch allocators may return uninitialized storage; for
         # cooperative launches, clear scratch before kernel launch.
-        if _is_tle_enabled() and self.launch_cooperative_grid and global_scratch is not None:
+        if self.launch_cooperative_grid and global_scratch is not None:
             zero_ = getattr(global_scratch, "zero_", None)
             if callable(zero_):
                 zero_()

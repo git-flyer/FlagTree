@@ -5,7 +5,7 @@ Cluster GEMM with TLE Remote
 
 Compare two GEMM implementations:
 - baseline Triton GEMM
-- cluster GEMM that reuses A tile via `tle.remote` inside a 2-block cluster
+- cluster GEMM that reuses A tile via `tled.remote` inside a 2-block cluster
 
 Run example:
   python python/tutorials/tle/04-cluster-gemm.py --m 4096 --n 4096 --k 4096
@@ -20,9 +20,10 @@ from typing import Callable
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language as tle
+import triton.experimental.tle as tled
+import triton.experimental.tle.language.gpu as tleg
 
-BLOCK_CLUSTER_MESH = tle.device_mesh({"block_cluster": [("cluster_x", 2)]})
+BLOCK_CLUSTER_MESH = tled.device_mesh({"block_cluster": [("cluster_x", 2)]})
 
 
 def _select_dot_k(bk: int) -> int:
@@ -119,7 +120,7 @@ def _cluster_remote_gemm_kernel(
     USE_NV_MMA_SMEM_LAYOUT: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    cluster_rank = tle.shard_id(mesh, "cluster_x")
+    cluster_rank = tled.shard_id(mesh, "cluster_x")
     cluster_id = pid // CLUSTER_SIZE
 
     num_pid_n = tl.cdiv(N, BN)
@@ -135,14 +136,14 @@ def _cluster_remote_gemm_kernel(
     a_rows_full = tl.broadcast_to(a_row_base[:, None], (BM, BK))
     a_cols_full = tl.broadcast_to(tl.arange(0, BK)[None, :], (BM, BK))
     a_rows_t = tl.broadcast_to(a_row_base[None, :], (DOT_K, BM))
-    a_buf = tle.gpu.alloc(
+    a_buf = tleg.alloc(
         [A_SLOTS, BM, BK],
         dtype=tl.float16,
         layout=None,
-        scope=tle.gpu.smem,
+        scope=tleg.smem,
         nv_mma_shared_layout=USE_NV_MMA_SMEM_LAYOUT,
     )
-    a_buf_remote = tle.remote(a_buf, 0, scope=mesh)
+    a_buf_remote = tled.remote(a_buf, 0, scope=mesh)
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     # Prefetch the first K-tile before entering the main loop, then keep
@@ -156,13 +157,13 @@ def _cluster_remote_gemm_kernel(
             a_tile = tl.load(a_ptrs, mask=a_mask_tile, other=0.0)
         else:
             a_tile = tl.load(a_ptrs)
-        a_local_ptr_tile = tle.gpu.local_ptr(a_buf, (slot0_full, a_rows_full, a_cols_full))
+        a_local_ptr_tile = tleg.local_ptr(a_buf, (slot0_full, a_rows_full, a_cols_full))
         if USE_MASK:
             tl.store(a_local_ptr_tile, a_tile, mask=a_mask_tile)
         else:
             tl.store(a_local_ptr_tile, a_tile)
 
-    tle.distributed_barrier(mesh)
+    tled.distributed_barrier(mesh)
 
     for k0 in range(0, K, BK):
         iter_idx = k0 // BK
@@ -172,7 +173,7 @@ def _cluster_remote_gemm_kernel(
             k_local = ks + tl.arange(0, DOT_K)
             a_cols_t = tl.broadcast_to(k_local[:, None], (DOT_K, BM))
             slot_dot_t = tl.zeros((DOT_K, BM), dtype=tl.int32) + slot
-            a_ptr_remote = tle.gpu.local_ptr(a_buf_remote, (slot_dot_t, a_rows_t, a_cols_t))
+            a_ptr_remote = tleg.local_ptr(a_buf_remote, (slot_dot_t, a_rows_t, a_cols_t))
             if USE_MASK:
                 a_mask_t = ((k0 + k_local)[:, None] < K) & (offs_m[None, :] < M)
                 a = tl.trans(tl.load(a_ptr_remote, mask=a_mask_t, other=0.0))
@@ -190,7 +191,7 @@ def _cluster_remote_gemm_kernel(
         # With a single slot, producer and consumer share the same DSMEM tile.
         # Ensure all CTAs finish reading current tile before rank0 overwrites it.
         if A_SLOTS == 1:
-            tle.distributed_barrier(mesh)
+            tled.distributed_barrier(mesh)
 
         next_k0 = k0 + BK
         has_next = next_k0 < K
@@ -204,13 +205,13 @@ def _cluster_remote_gemm_kernel(
                 a_tile = tl.load(a_ptrs, mask=a_mask_tile, other=0.0)
             else:
                 a_tile = tl.load(a_ptrs)
-            a_local_ptr_tile = tle.gpu.local_ptr(a_buf, (next_slot_full, a_rows_full, a_cols_full))
+            a_local_ptr_tile = tleg.local_ptr(a_buf, (next_slot_full, a_rows_full, a_cols_full))
             if USE_MASK:
                 tl.store(a_local_ptr_tile, a_tile, mask=a_mask_tile)
             else:
                 tl.store(a_local_ptr_tile, a_tile)
 
-        tle.distributed_barrier(mesh)
+        tled.distributed_barrier(mesh)
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     if USE_MASK:
@@ -365,9 +366,8 @@ def _verify_remote_lowering(
         num_warps=num_warps,
         num_stages=num_stages,
     )
-    cluster_dims = tuple(compiled.metadata.cluster_dims)
-    if cluster_dims != (2, 1, 1):
-        raise RuntimeError(f"unexpected cluster_dims={cluster_dims}, expect (2, 1, 1)")
+    if compiled.metadata.cluster_dims != (2, 1, 1):
+        raise RuntimeError(f"unexpected cluster_dims={compiled.metadata.cluster_dims}, expect (2, 1, 1)")
     ptx = compiled.asm.get("ptx", "")
     ttgir = compiled.asm.get("ttgir", "")
     has_remote = (("mapa.shared::cluster" in ptx) or ("tle.remote_pointers" in ttgir) or ("tle.remote_cta_id" in ttgir)

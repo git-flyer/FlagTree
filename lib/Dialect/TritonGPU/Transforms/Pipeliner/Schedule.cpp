@@ -263,8 +263,7 @@ void tt::CoarseSchedule::serialize(scf::ForOp &forOp) const {
 }
 
 // Create a CoarseSchedule based on forOp's <stage, cluster>.
-LogicalResult tt::CoarseSchedule::deSerialize(scf::ForOp &forOp,
-                                              bool normalizeClusterId) {
+LogicalResult tt::CoarseSchedule::deSerialize(scf::ForOp &forOp) {
   auto [minClusterId, maxClusterId] = getMinMaxCluster(forOp);
   std::optional<int> maxStage = tryGetMaxStage(forOp);
   if (!maxStage) {
@@ -273,16 +272,9 @@ LogicalResult tt::CoarseSchedule::deSerialize(scf::ForOp &forOp,
   numStages = *maxStage + 1;
 
   DenseMap<int, tt::CoarseSchedule::Cluster> clustersMap;
-  if (normalizeClusterId) {
-    for (int i = minClusterId; i < maxClusterId + 1; i++) {
-      clustersMap.insert({i, clusters.newAtBack()});
-    }
-  } else {
-    for (int i = 0; i < maxClusterId + 1; i++) {
-      clustersMap.insert({i, clusters.newAtBack()});
-    }
+  for (int i = minClusterId; i < maxClusterId + 1; i++) {
+    clustersMap.insert({i, clusters.newAtBack()});
   }
-
   for (Operation &op : forOp.getBody()->without_terminator()) {
     if (!op.hasAttr(mlir::triton::kLoopStageAttrName))
       continue;
@@ -348,7 +340,6 @@ void tt::scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule) {
         break;
     }
   };
-#endif
 
   int numStages = schedule.getNumStages();
   SmallVector<std::tuple<Operation *, int, tt::CoarseSchedule::Cluster>>
@@ -361,7 +352,6 @@ void tt::scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule) {
       schedule.insertDepsOfOp(op, stage, cluster, /*includeArg=*/false,
                               /*insertIfEarlier=*/true);
 
-#ifdef __TLE__
       // Keep software-pipelined ops after the nearest preceding barrier,
       // instead of disabling software pipelining for the whole loop.
       if (Operation *prevBarrier = getPrevBarrierLikeOpInBlock(op)) {
