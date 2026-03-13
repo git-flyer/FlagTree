@@ -26,7 +26,10 @@
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/LocationSnapshot.h"
+
+#ifdef __TLE__
 #include "tle/dialect/include/IR/Dialect.h" // flagtree tle raw
+#endif
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -41,6 +44,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
 
+#ifdef __TLE__
 // flagtree tle
 // Pointer to the TritonOpBuilder class, used to register IR ops for third-party
 // dialects.
@@ -48,6 +52,7 @@ static py::class_<TritonOpBuilder> *builderClassPtr = nullptr;
 namespace ir {
 py::class_<TritonOpBuilder> *getBuilderClass() { return builderClassPtr; }
 } // namespace ir
+#endif
 
 namespace {
 namespace py = pybind11;
@@ -376,9 +381,10 @@ void init_triton_ir(py::module &&m) {
                     math::MathDialect, arith::ArithDialect, scf::SCFDialect,
                     ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
                     LLVM::LLVMDialect, mlir::ub::UBDialect,
-                    mlir::triton::gluon::GluonDialect,
+#ifdef __TLE__
                     mlir::triton::tle::TleDialect // flagtree tle raw
-                    >();
+#endif
+                    mlir::triton::gluon::GluonDialect>();
     mlir::LLVM::registerInlinerInterface(registry);
     registerBuiltinDialectTranslation(registry);
     registerLLVMDialectTranslation(registry);

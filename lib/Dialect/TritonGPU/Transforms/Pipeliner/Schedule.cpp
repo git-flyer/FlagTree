@@ -348,6 +348,7 @@ void tt::scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule) {
         break;
     }
   };
+#endif
 
   int numStages = schedule.getNumStages();
   SmallVector<std::tuple<Operation *, int, tt::CoarseSchedule::Cluster>>
@@ -360,6 +361,7 @@ void tt::scheduleDependencies(scf::ForOp forOp, tt::CoarseSchedule &schedule) {
       schedule.insertDepsOfOp(op, stage, cluster, /*includeArg=*/false,
                               /*insertIfEarlier=*/true);
 
+#ifdef __TLE__
       // Keep software-pipelined ops after the nearest preceding barrier,
       // instead of disabling software pipelining for the whole loop.
       if (Operation *prevBarrier = getPrevBarrierLikeOpInBlock(op)) {

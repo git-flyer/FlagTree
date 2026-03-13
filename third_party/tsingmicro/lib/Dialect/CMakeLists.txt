@@ -1,5 +1,0 @@
-add_subdirectory(Address)
-add_subdirectory(TritonTilingExt)
-add_subdirectory(TritonStructured)
-add_subdirectory(MagicKernel)
-add_subdirectory(TsingMicroTx81)

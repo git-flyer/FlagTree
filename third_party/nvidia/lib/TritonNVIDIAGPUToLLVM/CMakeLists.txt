@@ -1,3 +1,12 @@
+if(FLAGTREE_TLE)
+    set(_TLE_LIBS 
+        TritonTLEAnalysis
+        TleToLLVM # flagtree tle raw
+    )
+else()
+    set(_TLE_LIBS "")
+endif()
+
 add_triton_library(TritonNVIDIAGPUToLLVM
     ConvertLayoutOpToLLVM.cpp
     ConvertWarpSpecializeToLLVM.cpp
@@ -32,8 +41,5 @@ add_triton_library(TritonNVIDIAGPUToLLVM
     MLIRReconcileUnrealizedCasts
     NVGPUIR
     MLIRUBToLLVM
-    # begin flagtree tle
-    TritonTLEAnalysis
-    # end flagtree tle
-    TleToLLVM # flagtree tle raw
+    ${_TLE_LIBS}
 )
