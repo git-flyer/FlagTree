@@ -1,5 +1,5 @@
 name: 'Code Format Check'
-description: 'Set up Python, run checkout, pre-commit, and auto-commit changes'
+description: 'Run checkout, set up python, pre-commit, and auto-commit changes'
 
 runs:
   using: "composite"
