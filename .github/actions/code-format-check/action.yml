@@ -3,13 +3,7 @@ description: 'Run checkout, set up python, pre-commit, and auto-commit changes'
 
 runs:
   using: "composite"
-  steps:
-    - name: Checkout code
-      id: checkout
-      uses: actions/checkout@v6
-      with:
-        token: ${{ secrets.BOT_PAT_TOKEN || github.token }}
-    
+  steps:    
     - name: Setup Python
       uses: actions/setup-python@v5
       with:
