@@ -64,8 +64,10 @@ createTLERawRegionByLLVMFunc(TritonOpBuilder &self, std::string_view text,
   OwningOpRef<ModuleOp> module = parseSourceString<ModuleOp>(text, config);
   assert(module && "Failed to parse LLVM IR text");
   LLVM::LLVMFuncOp func = nullptr;
-  // TODO: cuda inline function is not abled to call any func inside it now. This will cause <unknown>:0: error: inlinable function call in a function with a DISubprogram location must have a debug location
-  // add clang with -g will lead to failure
+  // TODO: cuda inline function is not abled to call any func inside it now.
+  // This will cause <unknown>:0: error: inlinable function call in a function
+  // with a DISubprogram location must have a debug location add clang with -g
+  // will lead to failure
   for (auto op : module->getOps<LLVM::LLVMFuncOp>()) {
     if (!op.empty() && op.getLinkage() != LLVM::Linkage::Internal) {
       if (func) {
