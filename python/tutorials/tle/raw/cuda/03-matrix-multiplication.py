@@ -1,12 +1,9 @@
 from pathlib import Path
-from typing_extensions import Literal as L
 
-from mlir import ir
-from mlir.dialects import arith, memref, nvvm, scf
 import torch
 import triton
 import triton.language as tl
-from triton.experimental.tle.raw import dialect, InOut, Input
+from triton.experimental.tle.raw import dialect
 import triton.experimental.tle.language.raw as tle_raw
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
@@ -57,9 +54,11 @@ def get_autotune_config():
                       num_warps=4),
     ]
 
+
 @dialect(name="cuda", file=Path(__file__).parent / "03-matrix-multiplication.cu")
 def edsl(*args, **kwargs):
     ...
+
 
 @triton.autotune(
     configs=get_autotune_config(),
