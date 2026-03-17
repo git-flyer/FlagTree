@@ -5,7 +5,7 @@ __device__ __forceinline__ float raw_half_to_float(uint16_t h) {
     asm volatile("cvt.f32.f16 %0, %1;" : "=f"(out) : "h"(h));
     return out;
 }
-
+// TODO：There is no native FP16 type in CUDA C++, so uint16_t is used instead.
 __device__ auto
 MatMul(__attribute__((address_space(3))) float *output_allocated,
        __attribute__((address_space(3))) float *output_aligned,
