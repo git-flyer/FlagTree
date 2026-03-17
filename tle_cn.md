@@ -420,7 +420,22 @@ x = tle.make_sharded_tensor(x_ptr, sharding=x_spec, shape=[M, K])
 x_full = tle.reshard(x, spec=tle.sharding(mesh, split=[], partial=[]))
 ```
 
-##### 3.2.5.5 `tle.remote` + `tle.distributed_barrier`
+##### 3.2.5.5 `tle.shard_id`
+
+- Signature: `tle.shard_id(mesh, axis)`
+- 含义：返回当前 program 在指定 mesh 轴上的坐标。
+- `axis` 可以是轴名称（如 `"node"`、`"device"`、`"cluster_x"`）或轴序号。
+- 典型用途：构造 ring 交换、分阶段 all-reduce、cluster 协同计算中的对端 shard ID。
+
+示例：查询当前 program 在 node/device 轴上的坐标
+
+```python
+mesh = tle.device_mesh({"node": 2, "device": 4})
+node_rank = tle.shard_id(mesh, "node")      # 0..1
+device_rank = tle.shard_id(mesh, "device")  # 0..3
+```
+
+##### 3.2.5.6 `tle.remote` + `tle.distributed_barrier`
 
 - `tle.remote`：显式读取/写入远端分片。
 - `tle.distributed_barrier`：仅同步传入 mesh/sub-mesh 对应的设备集合。
@@ -428,9 +443,10 @@ x_full = tle.reshard(x, spec=tle.sharding(mesh, split=[], partial=[]))
 示例：读取相邻 shard（ring 风格交换）
 
 ```python
-rank = tle.program_rank(mesh)
-next_rank = (rank + 1) % mesh.shape[0]
-remote_x = tle.remote(x, shard_id=(next_rank,), scope="device")
+node_rank = tle.shard_id(mesh, "node")
+device_rank = tle.shard_id(mesh, "device")
+next_device = (device_rank + 1) % mesh.shape[1]
+remote_x = tle.remote(x, shard_id=(node_rank, next_device), scope=mesh)
 tle.distributed_barrier(mesh)
 neighbor_vals = tl.load(remote_x)
 ```
@@ -478,14 +494,15 @@ a_smem_ptrs = tle.gpu.local_ptr(
 )
 ```
 
-- Signature: `tle.local_ptr(buffer, indices) -> tl.tensor`（pointer tensor）
+- Signature: `tle.local_ptr(buffer, indices=None) -> tl.tensor | tl.ptr`
 - Purpose: 在 shared memory buffer 上构建任意形状 pointer view，用于 `tl.load/tl.store`。
 - Parameters:
   - `buffer`: 由 `tle.alloc` 返回的 buffered_tensor（SMEM/TMEM）。
-  - `indices`: 整数 tensor 元组，长度必须等于 `rank(buffer)`，且每个 tensor 形状相同。
+  - `indices`: 可选整数 tensor 元组，长度必须等于 `rank(buffer)`，且每个 tensor 形状相同；若省略/传 `None`，由后端按 full indices 语义处理。
 - Semantics:
-  - 输出 pointer tensor 形状等于 indices 的公共形状。
+  - 当显式传入 `indices` 时，输出 pointer tensor 形状等于 indices 的公共形状。
   - 对输出形状中每个逻辑索引 `(i0, i1, ...)`，指针对应 `buffer[indices0(i0,...), indices1(i0,...), ...]`。
+  - 当 `indices=None` 时，返回覆盖整个 `buffer` 的 full-view 指针（rank>0 返回 `shape(buffer)` 的 pointer tensor，rank=0 返回标量 pointer）。
   - 返回指针位于 shared memory 地址空间（LLVM addrspace=3）。索引需为整数类型（i32/i64 等，lowering 时规约到 i32）。
   - 线性化为 row-major（最后一维最快）。共享内存布局/encoding 跟随 buffer memdesc。
 
@@ -888,24 +905,24 @@ def triton_sparse_mla_fwd(
 
 ### 4.4 TopK Selector
 
-TopK Selector 性能使用 `python/tutorials/tle/05-deepseek_v32_topk_selector.py`（`plot_name=tle-radix-topk-selector`）评估。
+TopK Selector 性能使用 `python/tutorials/tle/deepseek_v32/01-topk_selector.py`（`plot_name=tle-radix-topk-selector`）评估。
 
 #### 4.4.1 RTX 5060 Ti（本机实测）
 
 - 运行参数：本机（GeForce RTX 5060 Ti）执行 `--skip_correctness --warmup 10 --rep 80`。
 
-| batch | seq_len | topk | Torch-TopK | TileLang | TLE-Radix | **加速比（Torch-TopK / min(TileLang, TLE-Radix)）** |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 4096 | 128 | 0.038912 | 0.020480 | **0.019904** | 1.95x |
-| 64 | 8192 | 256 | 0.088608 | **0.028672** | **0.028672** | 3.09x |
-| 64 | 32768 | 1024 | 0.159808 | 0.073728 | **0.067040** | 2.38x |
-| 64 | 32768 | 2048 | 0.163296 | 0.075776 | **0.069632** | 2.35x |
+| batch | seq_len | topk | Torch-TopK | Triton-Radix | TileLang | TLE-Radix | **加速比（Torch-TopK / TLE-Radix）** |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 4096 | 128 | 0.038912 | 0.039456 | 0.020480 | **0.015808** | 2.46x |
+| 64 | 8192 | 256 | 0.088624 | 0.053248 | 0.028672 | **0.023936** | 3.70x |
+| 64 | 32768 | 1024 | 0.158272 | 0.131616 | 0.073728 | **0.062912** | 2.52x |
+| 64 | 32768 | 2048 | 0.163264 | 0.133120 | 0.075776 | **0.065536** | 2.49x |
 
 #### 4.4.2 H800（`tle-radix-topk-selector`）
 
-| batch | seq_len | topk | Torch-TopK | TileLang | TLE-Radix | **加速比（Torch-TopK / min(TileLang, TLE-Radix)）** |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 64 | 4096 | 128 | 0.045536 | 0.017184 | **0.017152** | 2.65x |
-| 64 | 8192 | 256 | 0.095168 | **0.021184** | 0.022144 | 4.49x |
-| 64 | 32768 | 1024 | 0.125184 | 0.043488 | **0.041728** | 3.00x |
-| 64 | 32768 | 2048 | 0.123744 | 0.043936 | **0.041824** | 2.96x |
+| batch | seq_len | topk | Torch-TopK | Triton-Radix | TileLang | TLE-Radix | **加速比（Torch-TopK / TLE-Radix）** |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 64 | 4096 | 128 | 0.045728 | 0.054256 | **0.017200** | 0.017472 | 2.62x |
+| 64 | 8192 | 256 | 0.097344 | 0.072512 | 0.020960 | **0.020928** | 4.65x |
+| 64 | 32768 | 1024 | 0.125008 | 0.176768 | 0.043088 | **0.041856** | 2.99x |
+| 64 | 32768 | 2048 | 0.125072 | 0.179264 | 0.044256 | **0.041984** | 2.98x |

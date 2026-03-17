@@ -26,7 +26,7 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language.gpu as tle
+import triton.experimental.tle.language as tle
 
 try:
     import tilelang
@@ -41,6 +41,12 @@ except Exception:  # pragma: no cover - optional dependency
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 RADIX_BITS = 8
 RADIX = 1 << RADIX_BITS
+TLE_TOPK_AUTOTUNE_CONFIGS = [
+    triton.Config({}, num_warps=4, num_stages=1),
+    triton.Config({}, num_warps=8, num_stages=1),
+    triton.Config({}, num_warps=16, num_stages=1),
+    triton.Config({}, num_warps=32, num_stages=1),
+]
 
 # %%
 # Key conversions
@@ -69,6 +75,10 @@ def _convert_to_uint16_hi8(x):
 # --------------------------
 
 
+@triton.autotune(
+    configs=TLE_TOPK_AUTOTUNE_CONFIGS,
+    key=["seq_len"],
+)
 @triton.jit
 def tle_topk_selector_kernel(
     x_ptr,
@@ -107,57 +117,57 @@ def tle_topk_selector_kernel(
     HIST_SIZE: tl.constexpr = 512
     bins = tl.arange(0, RADIX_SIZE)
 
-    s_histogram = tle.alloc(
+    s_histogram = tle.gpu.alloc(
         [HIST_SIZE],
         dtype=tl.int32,
         layout=None,
-        scope=tle.smem,
+        scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    hist_ptrs = tle.local_ptr(s_histogram, (bins, ))
+    hist_ptrs = tle.gpu.local_ptr(s_histogram, (bins, ))
 
     # Ping-pong candidate buffers in shared memory.
-    s_num_input = tle.alloc(
+    s_num_input = tle.gpu.alloc(
         [2],
         dtype=tl.int32,
         layout=None,
-        scope=tle.smem,
+        scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_input_idx = tle.alloc(
+    s_input_idx = tle.gpu.alloc(
         [2, SMEM_INPUT_SIZE],
         dtype=tl.int32,
         layout=None,
-        scope=tle.smem,
+        scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
 
     # Stage 1: coarse 8-bit prescreen on fp16-mapped keys.
     tl.store(hist_ptrs, tl.zeros([RADIX_SIZE], dtype=tl.int32))
-    tl.store(tle.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
-    tl.store(tle.local_ptr(s_num_input, (0, )), 0)
-    tl.store(tle.local_ptr(s_num_input, (1, )), 0)
+    tl.store(tle.gpu.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
+    tl.store(tle.gpu.local_ptr(s_num_input, (0, )), 0)
+    tl.store(tle.gpu.local_ptr(s_num_input, (1, )), 0)
     for t in tl.range(0, n_tiles):
         offs = t * BLOCK_SIZE + lane
         in_range = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
         x = tl.load(row_ptr + offs * stride_xn, mask=in_range, other=float("-inf"))
         digit8 = _convert_to_uint16_hi8(x)
-        tl.atomic_add(tle.local_ptr(s_histogram, (digit8, )), ones, mask=in_range, sem="relaxed", scope="cta")
+        tl.atomic_add(tle.gpu.local_ptr(s_histogram, (digit8, )), ones, mask=in_range, sem="relaxed", scope="cta")
 
     counts = tl.load(hist_ptrs)
     cumsum_desc = tl.cumsum(counts, axis=0, reverse=True)
     tl.store(hist_ptrs, cumsum_desc)
-    tl.store(tle.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
+    tl.store(tle.gpu.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
 
     # TileLang-style threshold: find bin with cumsum(bin) > k and cumsum(bin+1) <= k.
     new_topk = tl.full((), TOPK, dtype=tl.int32)
     cond = cumsum_desc > new_topk
     threshold_bin = tl.max(tl.where(cond, bins, 0), axis=0).to(tl.int32)
-    counts_gt = tl.load(tle.local_ptr(s_histogram, (threshold_bin + 1, )))
+    counts_gt = tl.load(tle.gpu.local_ptr(s_histogram, (threshold_bin + 1, )))
     new_topk = new_topk - counts_gt
 
     # Stage 2: write coarse winners and cache threshold-bin indices into shared memory.
-    num0_ptrs = tle.local_ptr(s_num_input, (tl.zeros([BLOCK_SIZE], dtype=tl.int32), ))
+    num0_ptrs = tle.gpu.local_ptr(s_num_input, (tl.zeros([BLOCK_SIZE], dtype=tl.int32), ))
     for t in tl.range(0, n_tiles):
         offs = t * BLOCK_SIZE + lane
         in_range = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
@@ -166,7 +176,7 @@ def tle_topk_selector_kernel(
 
         take_gt = in_range & (digit8 > threshold_bin)
         pos_gt = tl.atomic_add(
-            tle.local_ptr(s_histogram, (digit8 + 1, )),
+            tle.gpu.local_ptr(s_histogram, (digit8 + 1, )),
             ones,
             mask=take_gt,
             sem="relaxed",
@@ -177,7 +187,7 @@ def tle_topk_selector_kernel(
         take_eq = in_range & (digit8 == threshold_bin) & (new_topk > 0)
         pos_eq = tl.atomic_add(num0_ptrs, ones, mask=take_eq, sem="relaxed", scope="cta")
         tl.store(
-            tle.local_ptr(s_input_idx, (tl.zeros([BLOCK_SIZE], dtype=tl.int32), pos_eq)),
+            tle.gpu.local_ptr(s_input_idx, (tl.zeros([BLOCK_SIZE], dtype=tl.int32), pos_eq)),
             offs.to(tl.int32),
             mask=take_eq & (pos_eq < SMEM_INPUT_SIZE),
         )
@@ -191,22 +201,22 @@ def tle_topk_selector_kernel(
             start_pos = TOPK - new_topk
 
             tl.store(hist_ptrs, tl.zeros([RADIX_SIZE], dtype=tl.int32))
-            tl.store(tle.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
-            tl.store(tle.local_ptr(s_num_input, (nxt_buf, )), 0)
+            tl.store(tle.gpu.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
+            tl.store(tle.gpu.local_ptr(s_num_input, (nxt_buf, )), 0)
 
-            num_in = tl.load(tle.local_ptr(s_num_input, (cur_buf, )))
+            num_in = tl.load(tle.gpu.local_ptr(s_num_input, (cur_buf, )))
             num_in_tiles = tl.cdiv(num_in, BLOCK_SIZE)
 
             # Histogram over current candidate buffer.
             for t in tl.range(0, num_in_tiles):
                 pos = t * BLOCK_SIZE + lane
                 valid = pos < num_in
-                idx = tl.load(tle.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], cur_buf, tl.int32), pos)), mask=valid, other=0)
+                idx = tl.load(tle.gpu.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], cur_buf, tl.int32), pos)), mask=valid, other=0)
                 x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
                 key = _convert_to_uint32(x)
                 digit = ((key >> shift) & RADIX_MASK).to(tl.int32)
                 tl.atomic_add(
-                    tle.local_ptr(s_histogram, (digit, )),
+                    tle.gpu.local_ptr(s_histogram, (digit, )),
                     ones,
                     mask=valid,
                     sem="relaxed",
@@ -216,26 +226,26 @@ def tle_topk_selector_kernel(
             counts = tl.load(hist_ptrs)
             cumsum_desc = tl.cumsum(counts, axis=0, reverse=True)
             tl.store(hist_ptrs, cumsum_desc)
-            tl.store(tle.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
+            tl.store(tle.gpu.local_ptr(s_histogram, (RADIX_SIZE, )), 0)
 
             cond = cumsum_desc > new_topk
             threshold_bin = tl.max(tl.where(cond, bins, 0), axis=0).to(tl.int32)
-            counts_gt = tl.load(tle.local_ptr(s_histogram, (threshold_bin + 1, )))
+            counts_gt = tl.load(tle.gpu.local_ptr(s_histogram, (threshold_bin + 1, )))
             new_topk = new_topk - counts_gt
 
             # Partition candidates: winners to output, threshold equals to next buffer.
-            nxt_ptrs = tle.local_ptr(s_num_input, (tl.full([BLOCK_SIZE], nxt_buf, tl.int32), ))
+            nxt_ptrs = tle.gpu.local_ptr(s_num_input, (tl.full([BLOCK_SIZE], nxt_buf, tl.int32), ))
             for t in tl.range(0, num_in_tiles):
                 pos = t * BLOCK_SIZE + lane
                 valid = pos < num_in
-                idx = tl.load(tle.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], cur_buf, tl.int32), pos)), mask=valid, other=0)
+                idx = tl.load(tle.gpu.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], cur_buf, tl.int32), pos)), mask=valid, other=0)
                 x = tl.load(row_ptr + idx * stride_xn, mask=valid, other=float("-inf"))
                 key = _convert_to_uint32(x)
                 digit = ((key >> shift) & RADIX_MASK).to(tl.int32)
 
                 take_gt = valid & (digit > threshold_bin)
                 pos_gt = tl.atomic_add(
-                    tle.local_ptr(s_histogram, (digit + 1, )),
+                    tle.gpu.local_ptr(s_histogram, (digit + 1, )),
                     ones,
                     mask=take_gt,
                     sem="relaxed",
@@ -247,7 +257,7 @@ def tle_topk_selector_kernel(
                 take_eq = valid & (digit == threshold_bin) & (new_topk > 0)
                 if round_idx == 3:
                     pos_eq = tl.atomic_add(
-                        tle.local_ptr(s_histogram, (digit + 1, )),
+                        tle.gpu.local_ptr(s_histogram, (digit + 1, )),
                         ones,
                         mask=take_eq,
                         sem="relaxed",
@@ -258,7 +268,7 @@ def tle_topk_selector_kernel(
                 else:
                     nxt_pos = tl.atomic_add(nxt_ptrs, ones, mask=take_eq, sem="relaxed", scope="cta")
                     tl.store(
-                        tle.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], nxt_buf, tl.int32), nxt_pos)),
+                        tle.gpu.local_ptr(s_input_idx, (tl.full([BLOCK_SIZE], nxt_buf, tl.int32), nxt_pos)),
                         idx,
                         mask=take_eq & (nxt_pos < SMEM_INPUT_SIZE),
                     )
@@ -611,7 +621,6 @@ def tle_topk_selector(
     ends,
     topk,
     block_size=1024,
-    num_warps=16,
     out: Optional[torch.Tensor] = None,
     assume_aligned: Optional[bool] = None,
 ):
@@ -625,6 +634,7 @@ def tle_topk_selector(
         assume_aligned = (x.is_contiguous() and out.is_contiguous() and (seq_len % block_size == 0)
                           and torch.all(starts == 0).item() and torch.all(ends == seq_len).item())
 
+    batch, seq_len = x.shape
     grid = (batch, )
     tle_topk_selector_kernel[grid](
         x,
@@ -640,7 +650,6 @@ def tle_topk_selector(
         TOPK=topk,
         BLOCK_SIZE=block_size,
         SMEM_INPUT_SIZE=4096,
-        num_warps=num_warps,
     )
     return out
 
@@ -651,7 +660,6 @@ def triton_topk_selector(
     ends,
     topk,
     block_size=1024,
-    num_warps=16,
     out: Optional[torch.Tensor] = None,
     cand0: Optional[torch.Tensor] = None,
     cand1: Optional[torch.Tensor] = None,
@@ -679,6 +687,9 @@ def triton_topk_selector(
     assert cand0.shape == (batch, seq_len) and cand0.dtype == torch.int32 and cand0.is_cuda
     assert cand1.shape == (batch, seq_len) and cand1.dtype == torch.int32 and cand1.is_cuda
 
+    # Triton kernel uses kernel-specific tuning to avoid slow/unstable configs.
+    kernel_num_warps = 4 if block_size >= 1024 else 8
+
     grid = (batch, )
     triton_topk_selector_kernel[grid](
         x,
@@ -700,7 +711,7 @@ def triton_topk_selector(
         TOPK=topk,
         BLOCK_SIZE=block_size,
         RADIX_BITS=8,
-        num_warps=num_warps,
+        num_warps=kernel_num_warps,
         num_stages=1,
     )
     return out
@@ -772,7 +783,7 @@ _BENCH_STYLES = (
         args={},
     )
 )
-def benchmark(batch, seq_len, topk, provider, block_size, num_warps, warmup, rep):
+def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
     torch.manual_seed(1)
     x = torch.randn(batch, seq_len, device=DEVICE, dtype=torch.float32)
     starts = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
@@ -790,7 +801,6 @@ def benchmark(batch, seq_len, topk, provider, block_size, num_warps, warmup, rep
                 ends,
                 topk,
                 block_size=block_size,
-                num_warps=num_warps,
                 out=tle_out,
                 assume_aligned=assume_aligned,
             )
@@ -807,7 +817,6 @@ def benchmark(batch, seq_len, topk, provider, block_size, num_warps, warmup, rep
                 ends,
                 topk,
                 block_size=block_size,
-                num_warps=num_warps,
                 out=triton_out,
                 cand0=triton_cand0,
                 cand1=triton_cand1,
@@ -836,7 +845,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, num_warps, warmup, rep
     return ms, max_ms, min_ms
 
 
-def run_correctness(batch, seq_len, topk, block_size, num_warps):
+def run_correctness(batch, seq_len, topk, block_size):
     torch.manual_seed(1)
     x = torch.randn(batch, seq_len, device=DEVICE, dtype=torch.float32)
     starts = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
@@ -851,7 +860,6 @@ def run_correctness(batch, seq_len, topk, block_size, num_warps):
         ends,
         topk,
         block_size=block_size,
-        num_warps=num_warps,
         assume_aligned=assume_aligned,
     )
 
@@ -862,7 +870,6 @@ def run_correctness(batch, seq_len, topk, block_size, num_warps):
         ends,
         topk,
         block_size=block_size,
-        num_warps=num_warps,
         assume_aligned=assume_aligned,
     )
     print(f"Triton recall vs torch.topk: {_recall(triton_out, ref):.4f}")
@@ -876,12 +883,11 @@ def run_correctness(batch, seq_len, topk, block_size, num_warps):
         print("TileLang not available; skipping TileLang correctness.")
 
 
-def run_bench(block_size, num_warps, warmup, rep, show_plots):
+def run_bench(block_size, warmup, rep, show_plots):
     benchmark.run(
         print_data=True,
         show_plots=show_plots,
         block_size=block_size,
-        num_warps=num_warps,
         warmup=warmup,
         rep=rep,
     )
@@ -898,7 +904,6 @@ def main(argv=None):
     parser.add_argument("--seq_len", type=int, default=4096, help="sequence length")
     parser.add_argument("--topk", type=int, default=128, help="top-k")
     parser.add_argument("--block_size", type=int, default=1024, help="block size (threads)")
-    parser.add_argument("--num_warps", type=int, default=16, help="num warps")
     parser.add_argument("--warmup", type=int, default=5, help="warmup iters")
     parser.add_argument("--rep", type=int, default=20, help="benchmark iters")
     parser.add_argument("--show_plots", action="store_true", help="show plots in benchmark")
@@ -912,13 +917,11 @@ def main(argv=None):
             seq_len=args.seq_len,
             topk=args.topk,
             block_size=args.block_size,
-            num_warps=args.num_warps,
         )
 
     if not args.skip_bench:
         run_bench(
             block_size=args.block_size,
-            num_warps=args.num_warps,
             warmup=args.warmup,
             rep=args.rep,
             show_plots=args.show_plots,

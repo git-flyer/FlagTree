@@ -82,7 +82,7 @@ def main():
     print(f"{'='*60}")
 
     try:
-        import triton.experimental.tle as tle
+        import triton.experimental.tle.language as tle
         print("✅ TLE module import successful")
 
         # Test basic functionality

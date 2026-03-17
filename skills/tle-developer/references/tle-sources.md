@@ -49,7 +49,6 @@ Create and run this script directly.
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language.gpu as tleg
 
 @triton.jit
 def tle_axpy_kernel(x_ptr, y_ptr, out_ptr, n, alpha, BLOCK: tl.constexpr):
@@ -57,8 +56,8 @@ def tle_axpy_kernel(x_ptr, y_ptr, out_ptr, n, alpha, BLOCK: tl.constexpr):
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
 
-    smem = tleg.alloc([BLOCK], dtype=tl.float32, layout=None, scope=tleg.smem, nv_mma_shared_layout=False)
-    ptrs = tleg.local_ptr(smem, (tl.arange(0, BLOCK),))
+    smem = tle.gpu.alloc([BLOCK], dtype=tl.float32, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    ptrs = tle.gpu.local_ptr(smem, (tl.arange(0, BLOCK),))
 
     x = tl.load(x_ptr + offs, mask=mask, other=0.0)
     y = tl.load(y_ptr + offs, mask=mask, other=0.0)
@@ -109,11 +108,11 @@ Run:
 ### 2.1 `local_ptr` Contract (Current Code)
 API form:
 ```python
-ptr = tleg.local_ptr(buffer, indices)
+ptr = tle.gpu.local_ptr(buffer, indices)
 ```
 
 Rules:
-1. `buffer` must be a TLE buffered tensor from `tleg.alloc`.
+1. `buffer` must be a TLE buffered tensor from `tle.gpu.alloc`.
 2. `indices` must be tuple/list (or Triton tuple) and cannot be empty.
 3. Index count must equal buffer rank.
 4. Index dtype must be integer.
@@ -128,8 +127,10 @@ Rules:
 ### 2.3 Local Pointer Pipeline Invariants
 NVIDIA TTGIR pipeline local pointer segment:
 1. `add_early_assign_memory_space`
-2. `add_assign_local_pointers_encoding`
+2. `add_select_encodings`
 3. `add_insert_local_pointer_barriers`
+4. `add_optimize_local_pointer_loads`
+5. `add_optimize_local_pointer_stores`
 
 Do not reorder without proof and tests.
 
@@ -145,8 +146,8 @@ TLE conversion path includes:
 Use for elementwise fusion and short reuse windows.
 
 ```python
-smem = tleg.alloc([BLOCK], dtype=tl.float32, layout=None, scope=tleg.smem, nv_mma_shared_layout=False)
-ptrs = tleg.local_ptr(smem, (tl.arange(0, BLOCK),))
+smem = tle.gpu.alloc([BLOCK], dtype=tl.float32, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+ptrs = tle.gpu.local_ptr(smem, (tl.arange(0, BLOCK),))
 vals = tl.load(global_ptrs, mask=mask, other=0.0)
 tl.store(ptrs, vals, mask=mask)
 out = tl.load(ptrs, mask=mask, other=0.0)
@@ -158,21 +159,21 @@ Use when loading and slicing tiles.
 ```python
 rows = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, BK))
 cols = tl.broadcast_to(tl.arange(0, BK)[None, :], (BM, BK))
-ptr = tleg.local_ptr(tile_buf, (rows, cols))
+ptr = tle.gpu.local_ptr(tile_buf, (rows, cols))
 sub = tl.load(ptr)
 ```
 
 ### 3.3 `copy` vs `load/store`
-1. Use `tleg.copy` for explicit transfer operations and descriptor/TMA flows.
+1. Use `tle.gpu.copy` for explicit transfer operations and descriptor/TMA flows.
 2. Use `local_ptr + tl.load/store` for custom indexing and compute choreography.
 
 ### 3.4 Distributed Entry Pattern
 ```python
-import triton.experimental.tle as tled
+import triton.experimental.tle.language as tle
 
-mesh = tled.device_mesh({"block_cluster": [("cluster_x", 2), ("cluster_y", 2)]})
-sid = tled.shard_id(mesh, "cluster_x")
-tled.distributed_barrier(mesh)
+mesh = tle.device_mesh({"block_cluster": [("cluster_x", 2), ("cluster_y", 2)]})
+sid = tle.shard_id(mesh, "cluster_x")
+tle.distributed_barrier(mesh)
 ```
 
 ## 4. High-Performance Optimization Playbook
@@ -234,8 +235,8 @@ Search relevant code quickly:
 ```bash
 rg -n "def local_ptr\(|analyze_local_pointer_operation" python/triton/experimental/tle/language/gpu
 rg -n "LocalPointersOp::verify|kSharedMemoryAddressSpace" third_party/tle/dialect/lib/IR/Ops.cpp
-rg -n "TleAssignLocalPointersEncoding|TleInsertLocalPointerBarriers" third_party/tle/dialect/lib/Transforms
-rg -n "add_early_assign_memory_space|add_assign_local_pointers_encoding|add_insert_local_pointer_barriers" third_party/nvidia/backend/compiler.py
+rg -n "TleSelectEncodings|TleInsertLocalPointerBarriers" third_party/tle/dialect/lib/Transforms
+rg -n "add_early_assign_memory_space|add_select_encodings|add_insert_local_pointer_barriers" third_party/nvidia/backend/compiler.py
 rg -n "populateLocalPointersOpToLLVMPatterns|UnrealizedConversionCastOp|GPUDialect" third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp
 ```
 
@@ -291,7 +292,7 @@ What to do:
 
 ### 6.4 Transform and Pass Wiring
 Typical files:
-1. `third_party/tle/dialect/lib/Transforms/TleAssignLocalPointersEncoding.cpp`
+1. `third_party/tle/dialect/lib/Transforms/TleSelectEncodings.cpp`
 2. `third_party/tle/dialect/lib/Transforms/TleInsertLocalPointerBarriers.cpp`
 3. `third_party/nvidia/backend/compiler.py`
 4. `third_party/nvidia/lib/TritonNVIDIAGPUToLLVM/TritonGPUToLLVM.cpp`
@@ -339,7 +340,7 @@ A change is done only when:
 ### `triton.experimental.tle.language`
 - `load`, `gpu`, `raw`
 
-### `triton.experimental.tle.language.gpu`
+### `tle.gpu`
 - `pipeline`, `alloc`, `copy`, `local_ptr`, `memory_space`
 - `layout`, `shared_layout`, `swizzled_shared_layout`, `tensor_memory_layout`, `nv_mma_shared_layout`
 - `scope`, `smem`, `tmem`, `buffered_tensor`, `buffered_tensor_type`

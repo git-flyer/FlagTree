@@ -14,7 +14,7 @@ import sys
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language.gpu as tle
+import triton.experimental.tle.language as tle
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
@@ -73,14 +73,14 @@ def topk_kernel_radix_triton(
     n_tiles = tl.cdiv(n_cols, BLOCK_N)
 
     # Stage 1: shared-memory histogram storage for each radix digit.
-    smem_counts = tle.alloc(
+    smem_counts = tle.gpu.alloc(
         [RADIX_SIZE],
         dtype=tl.int32,
         layout=None,
-        scope=tle.smem,
+        scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    smem_count_ptrs = tle.local_ptr(smem_counts, (bins, ))
+    smem_count_ptrs = tle.gpu.local_ptr(smem_counts, (bins, ))
 
     # Stage 2: MSD radix-select; pick one digit bucket per pass.
     for digit_pos in tl.static_range(x_nbits - RADIX_BITS, -1, -RADIX_BITS):
@@ -95,7 +95,7 @@ def topk_kernel_radix_triton(
             matches = (x_key & desired_mask) == desired
             digit = ((x_key >> digit_pos) & RADIX_MASK).to(tl.int32)
             valid = mask_n & matches
-            count_addrs = tle.local_ptr(smem_counts, (digit, ))
+            count_addrs = tle.gpu.local_ptr(smem_counts, (digit, ))
             tl.atomic_add(count_addrs, one, mask=valid, sem="relaxed", scope="cta")
 
         counts = tl.load(smem_count_ptrs)
@@ -117,15 +117,15 @@ def topk_kernel_radix_triton(
     thr_bits = key_to_fpval(thr_key)
     thr_val = thr_bits.to(x_dtype, bitcast=True)
 
-    smem_write_count = tle.alloc(
+    smem_write_count = tle.gpu.alloc(
         [1],
         dtype=tl.int32,
         layout=None,
-        scope=tle.smem,
+        scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    tl.store(tle.local_ptr(smem_write_count, (0, )), 0)
-    write_count_ptrs = tle.local_ptr(smem_write_count, (tl.zeros([BLOCK_N], dtype=tl.int32), ))
+    tl.store(tle.gpu.local_ptr(smem_write_count, (0, )), 0)
+    write_count_ptrs = tle.gpu.local_ptr(smem_write_count, (tl.zeros([BLOCK_N], dtype=tl.int32), ))
 
     # Pass 1: write all values strictly greater than threshold.
     for t in tl.range(0, n_tiles):
@@ -143,10 +143,10 @@ def topk_kernel_radix_triton(
         tl.store(yi_ptrs, offs_n.to(tl.int32), mask=write_mask)
 
     # Pass 2: fill remaining slots with values equal to threshold (first-come-first-serve).
-    cur_count = tl.load(tle.local_ptr(smem_write_count, (0, )))
+    cur_count = tl.load(tle.gpu.local_ptr(smem_write_count, (0, )))
     if cur_count < k_limit:
         for t in tl.range(0, n_tiles):
-            cur_count = tl.load(tle.local_ptr(smem_write_count, (0, )))
+            cur_count = tl.load(tle.gpu.local_ptr(smem_write_count, (0, )))
             if cur_count < k_limit:
                 offs_n = t * BLOCK_N + tl.arange(0, BLOCK_N)
                 mask_n = offs_n < n_cols

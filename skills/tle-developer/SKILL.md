@@ -51,9 +51,9 @@ Impact scope (optional):
 ## Non-Negotiable Guardrails
 1. Never assume a specific python environment name.
 2. Never assume a fixed build script name.
-3. If native Triton files are modified, use marker blocks:
-`// begin flagtree tle` and `// end flagtree tle`.
-4. Do not add marker blocks inside `third_party/tle`.
+3. If native Triton files are modified for TLE-specific behavior, use compile-time guards like `#ifdef __TLE__` / `#endif`.
+4. Do not use comment marker blocks (`// begin flagtree tle` / `// end flagtree tle`) as a policy mechanism.
+5. Do not add `__TLE__` guards inside `third_party/tle` unless that subtree explicitly requires it.
 
 ## Required Outputs Per Task
 1. Validation commands and outcomes.
