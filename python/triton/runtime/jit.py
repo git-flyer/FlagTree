@@ -521,10 +521,19 @@ class JITCallable:
     # the user might want to monkey-patch self.src dynamically.
     # Our unit tests do this, for example.
     def parse(self):
+        from ..compiler.hint_manager import hint_trigger
+        # Maps line numbers to comment hints
+        line_flagtree_hints = hint_trigger("maps_line_numbers_to_comment_hints", self)
+        if line_flagtree_hints is None:
+            line_flagtree_hints = {}
+
         tree = ast.parse(self._src)
         assert isinstance(tree, ast.Module)
         assert len(tree.body) == 1
         assert isinstance(tree.body[0], ast.FunctionDef)
+
+        # Attach the line number to comment mapping to the function definition node
+        hint_trigger("attach_line_number_to_comment_mapping", tree, line_flagtree_hints)
         return tree
 
     @property

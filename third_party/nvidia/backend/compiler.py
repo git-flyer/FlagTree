@@ -1,5 +1,6 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm, nvidia
+from triton._C.libtriton import tle
 from triton import knobs
 from triton.runtime.errors import PTXASError
 
@@ -106,6 +107,7 @@ def sm_arch_from_capability(capability: int):
 class CUDAOptions:
     num_warps: int = 4
     num_ctas: int = 1
+    cluster_dims: Tuple[int, int, int] = (1, 1, 1)
     num_stages: int = 3
     warp_size: int = 32
     # maxnreg corresponds to the ptx parameter .maxnreg, which controls the
@@ -178,10 +180,26 @@ class CUDABackend(BaseBackend):
         args.update({k: opts[k] for k in CUDAOptions.__dataclass_fields__.keys() if k in opts if opts[k] is not None})
         capability = int(self._parse_arch(args["arch"]))
 
+        # begin flagtree tle
+        cluster_dims = args.get("cluster_dims", (1, 1, 1))
+        if not isinstance(cluster_dims, (tuple, list)) or len(cluster_dims) != 3:
+            raise ValueError(f"cluster_dims must be a tuple/list of 3 ints, got {cluster_dims!r}")
+        if not all(isinstance(v, int) and v > 0 for v in cluster_dims):
+            raise ValueError(f"cluster_dims values must be positive ints, got {cluster_dims!r}")
+        cluster_dims = tuple(cluster_dims)
+        args["cluster_dims"] = cluster_dims
+        # end flagtree tle
+
         if args.get("num_ctas", 1) > 1 and capability < 90:
             raise ValueError((f"num_ctas > 1 requires NVIDIA SM90+ (Hopper). "
                               f"Current target is sm_{capability}. This configuration will fail. "
                               f"Please set num_ctas=1 or target an SM90+ GPU."))
+        # begin flagtree tle
+        if functools.reduce(lambda a, b: a * b, cluster_dims, 1) > 1 and capability < 90:
+            raise ValueError((f"cluster_dims={cluster_dims} requires NVIDIA SM90+ (Hopper). "
+                              f"Current target is sm_{capability}. This configuration will fail. "
+                              f"Please use cluster_dims=(1, 1, 1) or target an SM90+ GPU."))
+        # end flagtree tle
 
         if "supported_fp8_dtypes" not in args:
             supported_fp8_dtypes = set(CUDAOptions.supported_fp8_dtypes)
@@ -201,10 +219,16 @@ class CUDABackend(BaseBackend):
         return CUDAOptions(**args)
 
     def pack_metadata(self, metadata):
+        cluster_dims = getattr(metadata, "cluster_dims", (1, 1, 1))
+        if not isinstance(cluster_dims, (tuple, list)) or len(cluster_dims) != 3:
+            cluster_dims = (1, 1, 1)
         return (
             metadata.num_warps,
             metadata.num_ctas,
             metadata.shared,
+            int(cluster_dims[0]),
+            int(cluster_dims[1]),
+            int(cluster_dims[2]),
         )
 
     def get_codegen_implementation(self, options):
@@ -253,13 +277,21 @@ class CUDABackend(BaseBackend):
         dump_enabled = pm.enable_debug()
         emuTF32 = (capability // 10 >= 8)
         passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        # flagtree tle raw
+        tle.raw_passes.add_tle_convert_arg_to_memdesc(pm)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
+        passes.ttgpuir.add_process_shared_memory_hint(pm)  # flagtree hints
         passes.ttgpuir.add_f32_dot_tc(pm, emuTF32)
         # TODO(Qingyi): Move PlanCTAPass to the front of CoalescePass
         nvidia.passes.ttnvgpuir.add_plan_cta(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_thread_locality(pm)
+        tle.passes.add_early_assign_memory_space(pm)
+        # begin flagtree tle
+        tle.passes.add_assign_local_pointers_encoding(pm)
+        tle.passes.add_insert_local_pointer_barriers(pm)
+        # end flagtree tle
         passes.ttgpuir.add_accelerate_matmul(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         passes.ttgpuir.add_optimize_dot_operands(pm, capability >= 80)
@@ -300,11 +332,15 @@ class CUDABackend(BaseBackend):
         passes.ttgpuir.add_coalesce_async_copy(pm)
         nvidia.passes.ttnvgpuir.add_optimize_tmem_layouts(pm)
         if capability // 10 >= 9:
+            # flagtree tle: Apply TLE TMA copy lowering before standard NVIDIA TMA lowering
+            tle.passes.add_lower_tma_copy(pm)
             nvidia.passes.ttnvgpuir.add_tma_lowering(pm)
         passes.ttgpuir.add_remove_layout_conversions(pm)
         nvidia.passes.ttnvgpuir.add_interleave_tmem(pm)
         passes.ttgpuir.add_reduce_data_duplication(pm)
         passes.ttgpuir.add_reorder_instructions(pm)
+        # flagtree tle: Lowering load with tt.load.async attribute
+        tle.passes.add_lower_async_load(pm)
         passes.ttir.add_loop_aware_cse(pm)
         passes.common.add_symbol_dce(pm)
         nvidia.passes.ttnvgpuir.add_fence_insertion(pm, capability)
@@ -314,6 +350,13 @@ class CUDABackend(BaseBackend):
         passes.common.add_canonicalizer(pm)
 
         pm.run(mod, 'make_ttgir')
+        # begin flagtree tle
+        # launch_cooperative_grid may be toggled during frontend semantic lowering
+        # (e.g. device_mesh + distributed_barrier grid mode), so refresh it here.
+        metadata["launch_cooperative_grid"] = opt.launch_cooperative_grid
+        # cluster_dims may also be inferred/updated by frontend mesh semantics.
+        metadata["cluster_dims"] = tuple(opt.cluster_dims)
+        # end flagtree tle
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
 
@@ -374,6 +417,8 @@ class CUDABackend(BaseBackend):
 
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
+        # flagtree tle raw
+        tle.raw_passes.add_tle_dsl_region_inline(pm)
 
         pm.run(mod, 'make_llir')
 

@@ -17,6 +17,7 @@ from ..language.core import _unwrap_if_constexpr, base_value, base_type
 # ideally we wouldn't need any runtime component
 from ..runtime.jit import get_jit_fn_file_line, get_full_name, JITCallable, BoundConstexprFunction, ConstexprFunction, JITFunction
 from .._utils import find_paths_if, get_iterable_path, set_iterable_path, is_namedtuple
+from .hint_manager import hint_trigger
 
 from .errors import (CompilationError, CompileTimeAssertionFailure, UnsupportedLanguageConstruct)
 
@@ -108,6 +109,24 @@ def _clone_triton_value(val):
     handles = []
     val._flatten_ir(handles)
     clone, _ = val.type._unflatten_ir(handles, 0)
+    # begin flagtree tle
+    # Preserve TLE compile-time metadata across scope cloning (if/loop
+    # live-ins). Value-level metadata can otherwise be dropped by unflatten.
+    if hasattr(val, "__dict__"):
+        for key, attr in val.__dict__.items():
+            if key.startswith("_tle_"):
+                try:
+                    setattr(clone, key, attr)
+                except Exception:
+                    pass
+    if hasattr(val.type, "__dict__"):
+        for key, attr in val.type.__dict__.items():
+            if key.startswith("_tle_"):
+                try:
+                    setattr(clone.type, key, attr)
+                except Exception:
+                    pass
+    # end flagtree tle
     return clone
 
 
@@ -285,6 +304,35 @@ class ASTFunction:
 class BoundJITMethod:
     __self__: base_value
     __func__: JITFunction
+
+
+# begin flagtree tle
+class LambdaFunction:
+
+    def __init__(self, generator, node: ast.Lambda, signature: inspect.Signature, captured_scope: Dict[str, Any]):
+        self._generator = generator
+        self._node = node
+        self._signature = signature
+        self._captured_scope = captured_scope
+        self.__name__ = "<lambda>"
+
+    def __call__(self, *args, **kwargs):
+        bound = self._signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        previous_scope = self._generator.lscope
+        previous_defs = self._generator.local_defs
+        try:
+            lscope = dict(self._captured_scope)
+            lscope.update(bound.arguments)
+            self._generator.lscope = lscope
+            self._generator.local_defs = previous_defs
+            return self._generator.visit(self._node.body)
+        finally:
+            self._generator.lscope = previous_scope
+            self._generator.local_defs = previous_defs
+
+
+# end flagtree tle
 
 
 class CodeGenerator(ast.NodeVisitor):
@@ -709,6 +757,52 @@ class CodeGenerator(ast.NodeVisitor):
                 setattr(assign, x, y)
         self.visit(assign)
         return self.visit(lhs)
+
+    # begin flagtree tle
+    def _evaluate_lambda_default(self, node):
+        if node is None:
+            return inspect._empty
+        try:
+            assert not self.visiting_arg_default_value
+            self.visiting_arg_default_value = True
+            return self.visit(node)
+        finally:
+            self.visiting_arg_default_value = False
+
+    def _build_lambda_signature(self, node: ast.Lambda) -> inspect.Signature:
+        args = node.args
+        posonly = list(args.posonlyargs)
+        pos_or_kw = list(args.args)
+        total_pos = len(posonly) + len(pos_or_kw)
+        defaults = [inspect._empty] * total_pos
+        if args.defaults:
+            start = total_pos - len(args.defaults)
+            for i, default_node in enumerate(args.defaults):
+                defaults[start + i] = self._evaluate_lambda_default(default_node)
+
+        params: List[inspect.Parameter] = []
+        for i, arg in enumerate(posonly):
+            default = defaults[i]
+            params.append(inspect.Parameter(arg.arg, inspect.Parameter.POSITIONAL_ONLY, default=default))
+        for i, arg in enumerate(pos_or_kw):
+            default = defaults[len(posonly) + i]
+            params.append(inspect.Parameter(arg.arg, inspect.Parameter.POSITIONAL_OR_KEYWORD, default=default))
+        if args.vararg is not None:
+            params.append(inspect.Parameter(args.vararg.arg, inspect.Parameter.VAR_POSITIONAL))
+        for i, arg in enumerate(args.kwonlyargs):
+            default = self._evaluate_lambda_default(args.kw_defaults[i])
+            params.append(inspect.Parameter(arg.arg, inspect.Parameter.KEYWORD_ONLY, default=default))
+        if args.kwarg is not None:
+            params.append(inspect.Parameter(args.kwarg.arg, inspect.Parameter.VAR_KEYWORD))
+
+        return inspect.Signature(params)
+
+    def visit_Lambda(self, node: ast.Lambda):
+        signature = self._build_lambda_signature(node)
+        captured_scope = dict(self.lscope)
+        return LambdaFunction(self, node, signature, captured_scope)
+
+    # end flagtree tle
 
     def visit_Name(self, node):
         if type(node.ctx) is ast.Store:
@@ -1147,7 +1241,14 @@ class CodeGenerator(ast.NodeVisitor):
         flatten = False
         warp_specialize = False
         disable_licm = False
-        if IteratorClass is language.range:
+        # flagtree tle
+        try:
+            from ..experimental.tle import language as tle
+            tle_pipeline = tle.gpu.pipeline
+        except ImportError:
+            tle_pipeline = None
+
+        if IteratorClass in [language.range, tle_pipeline]:
             iterator = IteratorClass(*iter_args, **iter_kwargs)
             # visit iterator arguments
             # note: only `range` iterator is supported now
@@ -1332,12 +1433,19 @@ class CodeGenerator(ast.NodeVisitor):
         return next(unflatten_ir_values(handles, [callee_ret_type]))
 
     def call_Function(self, node, fn, args, kws):
+        # 4. Get current line number and hints
+        flagtree_hints = hint_trigger("get_node_hints", self, node)
+
         if isinstance(fn, (BoundJITMethod, BoundConstexprFunction)):
             args.insert(0, fn.__self__)
             fn = fn.__func__
+
+        # 5. Handle JIT function calls
         if isinstance(fn, JITFunction):
             _check_fn_args(node, fn, args)
             return self.call_JitFunction(fn, args, kws)
+
+        # 6. Handle built-in functions or calls with special context
         if (hasattr(fn, '__self__') and _is_triton_value(fn.__self__)) or language.core.is_builtin(fn) or isinstance(
                 fn, ConstexprFunction):
             extra_kwargs = dict()
@@ -1351,6 +1459,9 @@ class CodeGenerator(ast.NodeVisitor):
             if '_generator' in sig.parameters:
                 extra_kwargs['_generator'] = self
             try:
+                # Special handling for tl.load with hints
+                hint_trigger("inject_kwargs_with_hints", fn, flagtree_hints, node.lineno, kws)
+
                 ret = fn(*args, **extra_kwargs, **kws)
                 # builtin functions return plain tuples for readability
                 if isinstance(ret, tuple):
@@ -1367,6 +1478,7 @@ class CodeGenerator(ast.NodeVisitor):
                 # be in core.py.
                 raise CompilationError(self.jit_fn.src, node, str(e)) from e
 
+        # 7. Handle calls from built-in namespace
         if fn in self.builtin_namespace.values() or (hasattr(fn, '__self__') and not _is_triton_value(fn.__self__)):
             args = map(_unwrap_if_constexpr, args)
         ret = fn(*args, **kws)
@@ -1386,8 +1498,10 @@ class CodeGenerator(ast.NodeVisitor):
         return self.call_Function(node, fn, args, kws)
 
     def visit_Call(self, node):
+        # 1. Get the called function object
         fn = _unwrap_if_constexpr(self.visit(node.func))
         if not isinstance(fn, BoundJITMethod):
+            # 2. Check if it's a statically implemented function
             static_implementation = self.statically_implemented_functions.get(fn)
             if static_implementation is not None:
                 return static_implementation(self, node)
@@ -1399,6 +1513,7 @@ class CodeGenerator(ast.NodeVisitor):
                 error_message.append(mur)
             raise CompilationError(self.jit_fn.src, node, " ".join(error_message))
 
+        # 3. Process keyword and positional arguments
         kws = dict(self.visit(keyword) for keyword in node.keywords)
         args = []
         for arg in node.args:

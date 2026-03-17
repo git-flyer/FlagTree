@@ -6,6 +6,10 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Support/LLVM.h"
+#ifdef __TLE__
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "tle/dialect/include/IR/Dialect.h" // flagtree tle raw
+#endif
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
@@ -86,9 +90,19 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
   addIllegalOp<scf::ExecuteRegionOp, scf::ParallelOp, scf::ReduceOp,
                scf::ReduceReturnOp>();
 
+#ifdef __TLE__
+  // flagtree tle raw
+  addDynamicallyLegalOp<triton::gpu::LocalAllocOp, triton::gpu::LocalStoreOp,
+                        triton::gpu::LocalLoadOp>(
+      [&](Operation *op) { return isDynamicallyLegal(op, typeConverter); });
+#endif
   addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect,
                              triton::TritonDialect, cf::ControlFlowDialect,
-                             scf::SCFDialect, ub::UBDialect>(
+                             scf::SCFDialect, ub::UBDialect,
+#ifdef __TLE__
+                             LLVM::LLVMDialect // flagtree tle raw
+#endif
+                             >(
       [&](Operation *op) { return isDynamicallyLegal(op, typeConverter); });
 
   // We have requirements for the data layouts
@@ -111,7 +125,18 @@ TritonGPUConversionTarget::TritonGPUConversionTarget(
     }
     return true;
   });
+
+#ifdef __TLE__
+  // flagtree tle raw
+  addDynamicallyLegalDialect<triton::tle::TleDialect>([&](Operation *op) {
+    bool hasLegalRegions = true;
+    for (auto &region : op->getRegions()) {
+      hasLegalRegions = hasLegalRegions && typeConverter.isLegal(&region);
+    }
+    return hasLegalRegions && typeConverter.isLegal(op);
+  });
 }
+#endif
 
 bool TritonGPUConversionTarget::isDynamicallyLegal(
     Operation *op, const TypeConverter &typeConverter) {

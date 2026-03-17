@@ -27,6 +27,9 @@
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Transforms/LocationSnapshot.h"
 
+#ifdef __TLE__
+#include "tle/dialect/include/IR/Dialect.h" // flagtree tle raw
+#endif
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -37,11 +40,21 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/SourceMgr.h"
 
-namespace {
+#ifdef __TLE__
+// flagtree tle
+// Pointer to the TritonOpBuilder class, used to register IR ops for third-party
+// dialects.
+static py::class_<TritonOpBuilder> *builderClassPtr = nullptr;
+namespace ir {
+py::class_<TritonOpBuilder> *getBuilderClass() { return builderClassPtr; }
+} // namespace ir
+#endif
 
+namespace {
 namespace py = pybind11;
 using namespace mlir;
 using namespace triton;
@@ -368,6 +381,9 @@ void init_triton_ir(py::module &&m) {
                     math::MathDialect, arith::ArithDialect, scf::SCFDialect,
                     ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
                     LLVM::LLVMDialect, mlir::ub::UBDialect,
+#ifdef __TLE__
+                    mlir::triton::tle::TleDialect, // flagtree tle raw
+#endif
                     mlir::triton::gluon::GluonDialect>();
     mlir::LLVM::registerInlinerInterface(registry);
     registerBuiltinDialectTranslation(registry);
@@ -799,9 +815,10 @@ void init_triton_ir(py::module &&m) {
 
   py::class_<OpBuilder::InsertPoint>(m, "InsertPoint", py::module_local());
 
-  py::class_<TritonOpBuilder>(m, "builder", py::module_local(),
-                              py::dynamic_attr())
-      .def(py::init<MLIRContext *>())
+  static py::class_<TritonOpBuilder> builderClass(
+      m, "builder", py::module_local(), py::dynamic_attr());
+  builderClassPtr = &builderClass;
+  builderClass.def(py::init<MLIRContext *>())
       .def("get_op_builder", &TritonOpBuilder::getBuilder, ret::reference)
       // getters
       .def("create_module",
@@ -1465,9 +1482,15 @@ void init_triton_ir(py::module &&m) {
       // Input/Output
       .def("create_load",
            [](TritonOpBuilder &self, Value &ptrs, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
+              EvictionPolicy evictionPolicy, bool isVolatile,
+              std::optional<std::string> flagtree_hints) -> Value {
+             // flagtree hints
+             auto hintsAttr =
+                 flagtree_hints
+                     ? mlir::StringAttr::get(self.getContext(), *flagtree_hints)
+                     : mlir::StringAttr::get(self.getContext(), "");
              return self.create<LoadOp>(ptrs, cacheModifier, evictionPolicy,
-                                        isVolatile);
+                                        isVolatile, hintsAttr);
            })
       .def("create_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &value,
@@ -1480,10 +1503,16 @@ void init_triton_ir(py::module &&m) {
               std::vector<int32_t> &boundaryCheck,
               std::optional<PaddingOption> paddingOption,
               CacheModifier cacheModifier, EvictionPolicy evictionPolicy,
-              bool isVolatile) -> Value {
+              bool isVolatile,
+              std::optional<std::string> flagtree_hints) -> Value {
+             // flagtree hints
+             auto hintsAttr =
+                 flagtree_hints
+                     ? mlir::StringAttr::get(self.getContext(), *flagtree_hints)
+                     : mlir::StringAttr::get(self.getContext(), "");
              return self.create<LoadOp>(ptr, boundaryCheck, paddingOption,
                                         cacheModifier, evictionPolicy,
-                                        isVolatile);
+                                        isVolatile, hintsAttr);
            })
       .def("create_tensor_pointer_store",
            [](TritonOpBuilder &self, Value &ptr, Value &val,
@@ -1495,10 +1524,16 @@ void init_triton_ir(py::module &&m) {
       .def("create_masked_load",
            [](TritonOpBuilder &self, Value &ptrs, Value &mask,
               std::optional<Value> &other, CacheModifier cacheModifier,
-              EvictionPolicy evictionPolicy, bool isVolatile) -> Value {
+              EvictionPolicy evictionPolicy, bool isVolatile,
+              std::optional<std::string> flagtree_hints) -> Value {
+             // flagtree hints
+             auto hintsAttr =
+                 flagtree_hints
+                     ? mlir::StringAttr::get(self.getContext(), *flagtree_hints)
+                     : mlir::StringAttr::get(self.getContext(), "");
              return self.create<LoadOp>(ptrs, mask, other.value_or(Value()),
                                         cacheModifier, evictionPolicy,
-                                        isVolatile);
+                                        isVolatile, hintsAttr);
            })
       .def("create_masked_store",
            [](TritonOpBuilder &self, Value &ptrs, Value &val, Value &mask,
@@ -1844,7 +1879,9 @@ void init_triton_ir(py::module &&m) {
              return self.create<MakeTensorDescOp>(base, shape, strides,
                                                   tensorShape, isSignedInteger,
                                                   paddingOption);
-           });
+           })
+
+      ;
 
   py::class_<PassManager>(m, "pass_manager", py::module_local())
       .def(py::init<MLIRContext *>())

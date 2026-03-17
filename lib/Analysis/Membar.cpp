@@ -1,4 +1,7 @@
 #include "triton/Analysis/Membar.h"
+#ifdef __TLE__
+#include "triton/Dialect/Triton/IR/Dialect.h"
+#endif
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
@@ -225,6 +228,18 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     scratchBufferId = allocation->getBufferId(op);
   }
 
+#ifdef __TLE__
+  // Preserve the 3.5 behavior for atomic chains in TLE mode: consecutive
+  // atomics on overlapping shared intervals do not require an extra CTA
+  // barrier here.
+  auto effectiveFilter = [&](Operation *lhs, Operation *rhs) -> bool {
+    if (isa<triton::AtomicRMWOp, triton::AtomicCASOp>(lhs) &&
+        isa<triton::AtomicRMWOp, triton::AtomicCASOp>(rhs))
+      return true;
+    return filter ? filter(lhs, rhs) : false;
+  };
+#endif
+
   // Scratch buffer operations consist of a series of shared memory operations
   // starting from a shared memory write, followed by a series of shared memory
   // read/write operations, and ending with a shared memory read, i.e., shared
@@ -243,15 +258,25 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
       isWarpSync = mlir::isCvtWarpSync(srcLayout, dstLayout);
     }
 
+#ifdef __TLE__
+    // Some scratch-buffer ops can also carry explicit shared-memory effects.
+    // Keep conservative dependency tracking instead of hard-failing here.
+#else
     if (!curBlockInfo.syncReadIntervals.empty() ||
         !curBlockInfo.syncWriteIntervals.empty()) {
       llvm::report_fatal_error(
           "scratch buffer operations should not have any shared memory "
           "dependencies");
     }
+#endif
     auto interval = allocation->getAllocatedInterval(scratchBufferId);
     curBlockInfo.syncWriteIntervals[interval].insert(op);
+#ifdef __TLE__
+    auto insertCTABarrier =
+        blockInfo->isIntersected(curBlockInfo, effectiveFilter);
+#else
     auto insertCTABarrier = blockInfo->isIntersected(curBlockInfo, filter);
+#endif
     if (insertCTABarrier) {
       builder->setInsertionPoint(op);
       insertBarrier(op, builder);
@@ -261,7 +286,11 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     if (insertCTABarrier || !isWarpSync)
       blockInfo->sync();
     curBlockInfo.syncReadIntervals[interval].insert(op);
+#ifdef __TLE__
+  } else if (blockInfo->isIntersected(curBlockInfo, effectiveFilter)) {
+#else
   } else if (blockInfo->isIntersected(curBlockInfo, filter)) {
+#endif
     builder->setInsertionPoint(op);
     insertBarrier(op, builder);
     blockInfo->sync();

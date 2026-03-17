@@ -1,8 +1,12 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+#ifdef __TLE__
+#include "tle/dialect/include/IR/Dialect.h"
+#endif
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -580,6 +584,11 @@ void populateTritonPatterns(TritonGPUTypeConverter &typeConverter,
       TritonScanPattern,
       GenericOpPattern<triton::ScanReturnOp>,
       GenericOpPattern<triton::MakeRangeOp>,
+#ifdef __TLE__
+      GenericOpPattern<triton::gpu::LocalAllocOp>,
+      GenericOpPattern<triton::gpu::LocalStoreOp>,
+      GenericOpPattern<triton::gpu::LocalLoadOp>,
+#endif
       TritonExpandDimsPattern,
       TritonTransPattern,
       TritonDotPattern,
@@ -793,6 +802,49 @@ void populateCFPatterns(TritonGPUTypeConverter &typeConverter,
   patterns.add<CFCondBranchPattern, CFBranchPattern>(typeConverter, context);
 }
 
+#ifdef __TLE__
+class TleDSLRegionOpPattern : public OpConversionPattern<tle::DSLRegionOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(tle::DSLRegionOp op, tle::DSLRegionOp::Adaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto newOp = rewriter.cloneWithoutRegions<tle::DSLRegionOp>(op);
+    Region &body = op.getBody(), &newBody = newOp.getBody();
+    rewriter.inlineRegionBefore(body, newBody, newBody.end());
+
+    if (failed(rewriter.convertRegionTypes(&newBody, *getTypeConverter()))) {
+      return rewriter.notifyMatchFailure(op, "could not convert body types");
+    }
+    newOp->setOperands(adaptor.getOperands());
+    for (OpResult result : newOp->getResults()) {
+      result.setType(getTypeConverter()->convertType(result.getType()));
+    }
+
+    rewriter.replaceOp(op, newOp->getResults());
+    return success();
+  }
+};
+
+void populateTleRawPatterns(TritonGPUTypeConverter &typeConverter,
+                            RewritePatternSet &patterns) {
+  MLIRContext *context = patterns.getContext();
+  patterns
+      .add<TleDSLRegionOpPattern, GenericOpPattern<tle::LocalPointersOp>,
+           GenericOpPattern<tle::RemotePointersOp>,
+           GenericOpPattern<tle::DistributedBarrierOp>,
+           GenericOpPattern<tle::YieldOp>,
+           GenericOpPattern<tle::ExtractAllocatedPtrOp>,
+           GenericOpPattern<tle::ExtractAlignedPtrOp>,
+           GenericOpPattern<tle::ExtractOffsetOp>,
+           GenericOpPattern<tle::ExtractSizesOp>,
+           GenericOpPattern<tle::ExtractStridesOp>,
+           GenericOpPattern<tle::ExtractPtrOp>, GenericOpPattern<tle::PackOp>>(
+          typeConverter, context);
+}
+#endif
+
 class ConvertTritonToTritonGPU
     : public triton::impl::ConvertTritonToTritonGPUBase<
           ConvertTritonToTritonGPU> {
@@ -823,6 +875,9 @@ public:
     //    mlir::scf::populateSCFStructurealTypeConversionsAndLegality(...) here?
     populateSCFPatterns(typeConverter, patterns);
     populateCFPatterns(typeConverter, patterns);
+#ifdef __TLE__
+    populateTleRawPatterns(typeConverter, patterns);
+#endif
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
 
     Builder b(&getContext());

@@ -1669,9 +1669,17 @@ bool comesFromLoadOrBlockArg(Value v) {
   }
   // We also accept block arguments as they appear in many MLIR tests
   // If this is problematic we can totally drop them
-  return isa<BlockArgument>(v) ||
-         (v.getDefiningOp() &&
-          isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp>(v.getDefiningOp()));
+  Operation *def = v.getDefiningOp();
+  bool fromLoad = def && isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp>(def);
+#ifdef __TLE__
+  bool fromSharedMemory =
+      def && def->hasAttrOfType<StringAttr>("tt.memory_space") &&
+      def->getAttrOfType<StringAttr>("tt.memory_space").getValue() ==
+          "shared_memory";
+  return isa<BlockArgument>(v) || fromLoad || fromSharedMemory;
+#else
+  return isa<BlockArgument>(v) || fromLoad;
+#endif
 }
 
 SmallVector<Value> getTiedArgs(Operation *op, int resultIdx) {

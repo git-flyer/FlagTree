@@ -42,8 +42,17 @@ except ImportError:
 
 
 sys.path.insert(0, os.path.dirname(__file__))
+from python.setup_tools import setup_helper as helper
 
 from python.build_helpers import get_base_dir, get_cmake_dir
+
+# flagtree setup print config
+if platform.system() == "Windows":
+    YELLOW = ""
+    RESET = ""
+else:
+    YELLOW = "\033[1;33m"
+    NC = "\033[0m"
 
 
 def is_git_repo():
@@ -193,8 +202,16 @@ def is_linux_os(id):
     return False
 
 
-# llvm
+# -----flagtree-tle-raw-----
+
+
 def get_llvm_package_info():
+    FLAGTREE_MLIR_PKG = "flagtree_mlir"
+    if helper.try_setup_flagtree_mlir(FLAGTREE_MLIR_PKG):
+        return Package("llvm", "llvm-C.lib", "", "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH")
+
+    # rule3: no wheel & env → use env
+    print("[DECISION] LLVM wheel not found, fallback to legacy logic")
     system = platform.system()
     try:
         arch = {"x86_64": "x64", "arm64": "arm64", "aarch64": "arm64"}[platform.machine()]
@@ -241,6 +258,9 @@ def get_llvm_package_info():
     sym_name = f"llvm-{system_suffix}"
     url = f"https://oaitriton.blob.core.windows.net/public/llvm-builds/{name}.tar.gz"
     return Package("llvm", name, url, "LLVM_INCLUDE_DIRS", "LLVM_LIBRARY_DIR", "LLVM_SYSPATH", sym_name=sym_name)
+
+
+# --------------------------
 
 
 def open_url(url):
@@ -299,7 +319,8 @@ def get_thirdparty_packages(packages: list):
             with contextlib.suppress(Exception):
                 shutil.rmtree(package_root_dir)
             os.makedirs(package_root_dir, exist_ok=True)
-            print(f'downloading and extracting {p.url} ...')
+            print(f'{YELLOW}downloading and extracting {p.url} to {package_root_dir} ... {NC}', file=sys.stderr,
+                  flush=True)
             with open_url(p.url) as response:
                 if p.url.endswith(".zip"):
                     file_bytes = BytesIO(response.read())
@@ -352,7 +373,7 @@ def download_and_copy(name, src_func, dst_path, variable, version, url_func):
         assert curr_version is not None, f"No version information for {dst_path}"
         download = download or curr_version.group(1) != version
     if download:
-        print(f'downloading and extracting {url} ...')
+        print(f'{YELLOW}downloading and extracting {url} ... {NC}', file=sys.stderr, flush=True)
         with open_url(url) as url_file, tarfile.open(fileobj=url_file, mode="r|*") as tar_file:
             # Use extractall without filter for Python version < 3.12 compatibility
             if hasattr(tarfile, 'data_filter'):
@@ -360,7 +381,7 @@ def download_and_copy(name, src_func, dst_path, variable, version, url_func):
             else:
                 tar_file.extractall(path=tmp_path)
     os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
-    print(f'copy {src_path} to {dst_path} ...')
+    print(f'copy {src_path} to {dst_path} ...', file=sys.stderr, flush=True)
     if os.path.isdir(src_path):
         shutil.copytree(src_path, dst_path, dirs_exist_ok=True)
     else:
@@ -467,6 +488,7 @@ class CMakeBuild(build_ext):
             "-DTRITON_PLUGIN_DIRS=" + ';'.join([b.src_dir for b in backends if b.is_external]),
             "-DTRITON_WHEEL_DIR=" + wheeldir
         ]
+        cmake_args += helper.get_backend_cmake_args(build_ext=self)
         if lit_dir is not None:
             cmake_args.append("-DLLVM_EXTERNAL_LIT=" + lit_dir)
         cmake_args.extend(thirdparty_cmake_args)
@@ -531,6 +553,7 @@ class CMakeBuild(build_ext):
         update_symlink(Path(self.base_dir) / "compile_commands.json", cmake_dir / "compile_commands.json")
         subprocess.check_call(["cmake", "--build", "."] + build_args, cwd=cmake_dir)
         subprocess.check_call(["cmake", "--build", ".", "--target", "mlir-doc"], cwd=cmake_dir)
+        helper.install_extension(build_ext=self)
 
 
 def download_and_copy_dependencies():
@@ -619,7 +642,19 @@ def download_and_copy_dependencies():
     )
 
 
-backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+if helper.flagtree_backend:
+    if helper.flagtree_backend in ("aipu", "tsingmicro", "enflame"):
+        backends = [
+            *BackendInstaller.copy(helper.configs.default_backends + tuple(helper.configs.extend_backends)),
+            *BackendInstaller.copy_externals(),
+        ]
+    else:
+        backends = [*BackendInstaller.copy(helper.configs.extend_backends), *BackendInstaller.copy_externals()]
+else:
+    print(helper.configs.default_backends)
+    backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
+
+#backends = [*BackendInstaller.copy(["nvidia", "amd"]), *BackendInstaller.copy_externals()]
 
 
 def get_package_dirs():
@@ -667,6 +702,11 @@ def get_packages():
             for x in os.listdir(backend.tools_dir):
                 yield f"triton.tools.extra.{x}"
 
+    if helper.flagtree_backend == "xpu":
+        yield f"triton.language.extra.xpu"
+    elif helper.flagtree_backend == "mthreads":
+        yield f"triton/language/extra/musa"
+
     if check_env_flag("TRITON_BUILD_PROTON", "ON"):  # Default ON
         yield "triton.profiler"
 
@@ -698,6 +738,16 @@ def add_link_to_backends(external_only):
                 update_symlink(install_dir, src_dir)
 
 
+package_data_tools = ["compile.h", "compile.c"]
+if helper.flagtree_backend == "xpu":
+    package_data_tools += ["compile_xpu.h", "compile_xpu.c"]
+#  package_data = {
+#       "triton/tools/extra": sum((b.tools_package_data for b in backends), []),
+#  **{f"triton/backends/{b.name}": b.package_data
+#  for b in backends}, "triton/language/extra": sum((b.language_package_data for b in backends), [])
+# }
+
+
 def add_link_to_proton():
     proton_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "third_party", "proton", "proton"))
     proton_install_dir = os.path.join(os.path.dirname(__file__), "python", "triton", "profiler")
@@ -715,11 +765,13 @@ class plugin_bdist_wheel(bdist_wheel):
     def run(self):
         add_links(external_only=True)
         super().run()
+        helper.post_install()
 
 
 class plugin_develop(develop):
 
     def run(self):
+        helper.uninstall_triton()
         add_links(external_only=False)
         super().run()
 
@@ -741,6 +793,7 @@ class plugin_egg_info(egg_info):
 class plugin_install(install):
 
     def run(self):
+        helper.uninstall_triton()
         add_links(external_only=True)
         super().run()
 
@@ -791,20 +844,6 @@ def get_git_version_suffix():
         return get_git_commit_hash()
 
 
-def get_triton_version_suffix():
-    # Either "" or "+<githash>", "<githash>" itself does not contain any plus-characters.
-    git_sfx = get_git_version_suffix()
-    # Should start with "+" that will replaced with "-" if needed
-    env_sfx = os.environ.get("TRITON_WHEEL_VERSION_SUFFIX", "")
-    # version suffix can only contain one plus-character
-    if "+" in git_sfx and "+" in env_sfx:
-        env_sfx = env_sfx.replace("+", "-")
-    return git_sfx + env_sfx
-
-
-# keep it separate for easy substitution
-TRITON_VERSION = "3.6.0" + get_triton_version_suffix()
-
 # Dynamically define supported Python versions and classifiers
 MIN_PYTHON = (3, 10)
 MAX_PYTHON = (3, 14)
@@ -821,13 +860,19 @@ PYTHON_CLASSIFIERS = [
 ]
 CLASSIFIERS = BASE_CLASSIFIERS + PYTHON_CLASSIFIERS
 
+readme_path = os.path.join(get_base_dir(), "README.md")
+with open(readme_path, "r", encoding="utf-8") as fh:
+    long_description = fh.read()
+
 setup(
-    name=os.environ.get("TRITON_WHEEL_NAME", "triton"),
-    version=TRITON_VERSION,
-    author="Philippe Tillet",
-    author_email="phil@openai.com",
-    description="A language and compiler for custom Deep Learning operations",
-    long_description="",
+    name=os.environ.get("FLAGTREE_WHEEL_NAME", "flagtree"),
+    version="0.4.1" + os.environ.get("FLAGTREE_WHEEL_VERSION_SUFFIX", ""),
+    author="FlagOS",
+    author_email="contact@flagos.io",
+    description=
+    "A unified compiler supporting multiple AI chip backends for custom Deep Learning operations, which is forked from triton-lang/triton.",
+    long_description=long_description,
+    long_description_content_type="text/markdown",
     install_requires=[
         "importlib-metadata; python_version < '3.10'",
     ],
@@ -857,6 +902,7 @@ setup(
     extras_require={
         "build": [
             "cmake>=3.20,<4.0",
+            "GitPython",
             "lit",
         ],
         "tests": [
