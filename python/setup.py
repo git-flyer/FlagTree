@@ -701,9 +701,16 @@ def get_packages():
         "triton/runtime",
         "triton/backends",
         "triton/tools",
+
+        # for flagtree tle
+        "triton/experimental",
+        "triton/experimental/tle",
+        "triton/experimental/tle/language",
+        "triton/experimental/tle/language/dsa",
     ]
     if helper.flagtree_backend and helper.flagtree_backend in helper.configs.language_extra_backends:
         packages.append(f"triton/language/extra/{helper.get_device_name()}")
+        packages.append("triton/experimental/tle/language/dsa/{helper.get_device_name()}")
     packages += helper.get_extra_packages()
     packages += get_language_extra_packages()
     packages += [f'triton/backends/{backend.name}' for backend in backends]
@@ -762,7 +769,7 @@ with open(readme_path, "r", encoding="utf-8") as fh:
 
 setup(
     name=os.environ.get("FLAGTREE_WHEEL_NAME", "flagtree"),
-    version="0.4.1" + os.environ.get("FLAGTREE_WHEEL_VERSION_SUFFIX", ""),
+    version=os.environ.get("FLAGTREE_WHEEL_VERSION", "") or "0.5.0" + get_git_commit_hash(),
     author="FlagOS",
     author_email="contact@flagos.io",
     description=
