@@ -38,7 +38,8 @@ from triton.compiler.compiler import ASTSource
 from triton.compiler.code_generator import ast_to_ttir
 from triton._C.libtriton import ir, ascend
 from triton._C.libtriton.ascend import ir as ascend_ir
-from triton.backends.ascend.compiler import NPUOptions
+from triton.backends.ascend.compiler import NPUOptions, min_dot_size
+from triton.backends.compiler import GPUTarget
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +101,12 @@ def get_ttir_str(kernel_fn, signature, constants):
     ascend_ir.load_dialects(context)
     ascend.load_dialects(context)
     options = NPUOptions()
-    ttir = ast_to_ttir(kernel_fn, src, context, options, {}, {})
+    target = GPUTarget("npu", options.arch, 64)
+    codegen_fns = {"min_dot_size": min_dot_size(target)}
+    # Apply ascend patch for hint processing
+    from triton.backends.ascend import _apply_ascend_patch
+    _apply_ascend_patch()
+    ttir = ast_to_ttir(kernel_fn, src, context, options, codegen_fns, {})
     return str(ttir)
 
 
