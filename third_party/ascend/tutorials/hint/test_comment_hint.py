@@ -37,6 +37,8 @@ import triton.language as tl
 from triton.compiler.compiler import ASTSource
 from triton.compiler.code_generator import ast_to_ttir
 from triton._C.libtriton import ir
+from triton._C.libtriton.ascend import ir as ascend_ir
+from triton.backends.ascend.compiler import NPUOptions
 
 
 # ---------------------------------------------------------------------------
@@ -86,15 +88,9 @@ def get_ttir_str(kernel_fn, signature, constants):
     src = ASTSource(kernel_fn, signature, constants)
     context = ir.context()
     ir.load_dialects(context)
-
-    # Load ascend dialects if available
-    try:
-        from triton._C import libtriton_ascend
-        libtriton_ascend.load_dialects(context)
-    except (ImportError, AttributeError):
-        pass
-
-    ttir = ast_to_ttir(src.fn, src, context=context, options=src.parse_options())
+    ascend_ir.load_dialects(context)
+    options = NPUOptions()
+    ttir = ast_to_ttir(kernel_fn, src, context, options, {}, {})
     return str(ttir)
 
 
