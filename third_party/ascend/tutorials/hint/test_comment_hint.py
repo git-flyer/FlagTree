@@ -38,6 +38,7 @@ from triton.compiler.compiler import ASTSource
 from triton.compiler.code_generator import ast_to_ttir
 from triton._C.libtriton import ir
 from triton._C.libtriton.ascend import ir as ascend_ir
+from triton._C import libtriton_ascend
 from triton.backends.ascend.compiler import NPUOptions
 
 
@@ -46,12 +47,21 @@ from triton.backends.ascend.compiler import NPUOptions
 # ---------------------------------------------------------------------------
 @triton.jit
 def matmul_hint_kernel(
-    a_ptr, b_ptr, c_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -89,6 +99,7 @@ def get_ttir_str(kernel_fn, signature, constants):
     context = ir.context()
     ir.load_dialects(context)
     ascend_ir.load_dialects(context)
+    libtriton_ascend.load_dialects(context)
     options = NPUOptions()
     ttir = ast_to_ttir(kernel_fn, src, context, options, {}, {})
     return str(ttir)
@@ -103,11 +114,18 @@ def test_ir_hint_annotations():
     print("=" * 60)
 
     signature = {
-        "a_ptr": "*fp16", "b_ptr": "*fp16", "c_ptr": "*fp16",
-        "M": "i32", "N": "i32", "K": "i32",
-        "stride_am": "i32", "stride_ak": "i32",
-        "stride_bk": "i32", "stride_bn": "i32",
-        "stride_cm": "i32", "stride_cn": "i32",
+        "a_ptr": "*fp16",
+        "b_ptr": "*fp16",
+        "c_ptr": "*fp16",
+        "M": "i32",
+        "N": "i32",
+        "K": "i32",
+        "stride_am": "i32",
+        "stride_ak": "i32",
+        "stride_bk": "i32",
+        "stride_bn": "i32",
+        "stride_cm": "i32",
+        "stride_cn": "i32",
     }
     constants = {"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64}
 
@@ -159,12 +177,21 @@ def test_e2e_matmul_with_hints():
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     matmul_hint_kernel[grid](
-        a, b, c,
-        M, N, K,
-        a.stride(0), a.stride(1),
-        b.stride(0), b.stride(1),
-        c.stride(0), c.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+        a,
+        b,
+        c,
+        M,
+        N,
+        K,
+        a.stride(0),
+        a.stride(1),
+        b.stride(0),
+        b.stride(1),
+        c.stride(0),
+        c.stride(1),
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
     )
 
     c_ref = torch.matmul(a, b)
