@@ -1989,6 +1989,9 @@ namespace kernels {
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
     int const stride1, int const next_n, int const topK, cudaStream_t const stream);
+void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
+    int const numRows, int const numColumns, int const stride0, int const stride1, int const topK,
+    cudaStream_t const stream);
 }
 
 void indexer_topk_decode(torch::Tensor logits, torch::Tensor seq_lens, torch::Tensor out,
@@ -2024,8 +2027,36 @@ void indexer_topk_decode(torch::Tensor logits, torch::Tensor seq_lens, torch::Te
       at::cuda::getDefaultCUDAStream(logits.get_device()));
 }
 
+void indexer_topk_prefill(torch::Tensor logits, torch::Tensor row_starts, torch::Tensor row_ends, torch::Tensor out,
+    int64_t topk) {
+  TORCH_CHECK(logits.is_cuda() && row_starts.is_cuda() && row_ends.is_cuda() && out.is_cuda());
+  TORCH_CHECK(logits.dtype() == torch::kFloat32);
+  TORCH_CHECK(row_starts.dtype() == torch::kInt32);
+  TORCH_CHECK(row_ends.dtype() == torch::kInt32);
+  TORCH_CHECK(out.dtype() == torch::kInt32);
+  TORCH_CHECK(logits.dim() == 2 && row_starts.dim() == 1 && row_ends.dim() == 1 && out.dim() == 2);
+
+  int numRows = static_cast<int>(logits.size(0));
+  int numColumns = static_cast<int>(logits.size(1));
+  TORCH_CHECK(row_starts.size(0) == numRows && row_ends.size(0) == numRows);
+  TORCH_CHECK(out.size(0) == numRows && out.size(1) == topk);
+
+  kernels::invokeIndexerTopKPrefill(
+      logits.data_ptr<float>(),
+      row_starts.data_ptr<int>(),
+      row_ends.data_ptr<int>(),
+      out.data_ptr<int>(),
+      numRows,
+      numColumns,
+      static_cast<int>(logits.stride(0)),
+      static_cast<int>(logits.stride(1)),
+      static_cast<int>(topk),
+      at::cuda::getDefaultCUDAStream(logits.get_device()));
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("indexer_topk_decode", &indexer_topk_decode, "TRT-LLM indexerTopK decode");
+  m.def("indexer_topk_prefill", &indexer_topk_prefill, "TRT-LLM indexerTopK prefill");
 }
 """
 
@@ -2092,13 +2123,18 @@ def _load_embedded_trtllm_indexer_topk():
         print(f"warning: failed to compile embedded trtllm indexerTopK kernel: {ex}")
         return None
 
-    fn = getattr(module, "indexer_topk_decode", None)
-    if fn is None:
+    decode_fn = getattr(module, "indexer_topk_decode", None)
+    prefill_fn = getattr(module, "indexer_topk_prefill", None)
+    if decode_fn is None:
         print("warning: embedded trtllm topk module has no indexer_topk_decode symbol")
-    return fn
+    if prefill_fn is None:
+        print("warning: embedded trtllm topk module has no indexer_topk_prefill symbol")
+    if decode_fn is None and prefill_fn is None:
+        return None
+    return module
 
 
-def trtllm_cuda_topk_selector(
+def trtllm_cuda_topk_selector_decode(
     x: torch.Tensor,
     starts: torch.Tensor,
     ends: torch.Tensor,
@@ -2117,10 +2153,34 @@ def trtllm_cuda_topk_selector(
         out_logits_aux = torch.empty((x.shape[0], aux_cols), dtype=torch.float32, device=x.device)
     if out_indices_aux is None:
         out_indices_aux = torch.empty((x.shape[0], aux_cols), dtype=torch.int32, device=x.device)
-    fn = _load_embedded_trtllm_indexer_topk()
-    if fn is None:
+    module = _load_embedded_trtllm_indexer_topk()
+    if module is None:
         raise RuntimeError("TRT-LLM indexerTopK extension unavailable")
+    fn = getattr(module, "indexer_topk_decode", None)
+    if fn is None:
+        raise RuntimeError("TRT-LLM decode symbol unavailable")
     fn(x, ends, out, out_logits_aux, out_indices_aux, 1, int(topk))
+    return out
+
+
+def trtllm_cuda_topk_selector_prefill(
+    x: torch.Tensor,
+    starts: torch.Tensor,
+    ends: torch.Tensor,
+    topk: int,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if x.dtype != torch.float32:
+        x = x.float()
+    if out is None:
+        out = torch.full((x.shape[0], topk), -1, dtype=torch.int32, device=x.device)
+    module = _load_embedded_trtllm_indexer_topk()
+    if module is None:
+        raise RuntimeError("TRT-LLM indexerTopK extension unavailable")
+    fn = getattr(module, "indexer_topk_prefill", None)
+    if fn is None:
+        raise RuntimeError("TRT-LLM prefill symbol unavailable")
+    fn(x, starts, ends, out, int(topk))
     return out
 
 
@@ -2408,7 +2468,8 @@ _BENCH_PROVIDERS = (
     ["torch"]
     + ["triton"]
     + ["sglang-cuda"]
-    + ["trtllm-cuda"]
+    + ["trtllm-decode"]
+    + ["trtllm-prefill"]
     + ["flashinfer-cuda"]
     + ["tle"]
     + (["tilelang"] if _HAVE_TILELANG else [])
@@ -2417,7 +2478,8 @@ _BENCH_NAMES = (
     ["Torch"]
     + ["Triton"]
     + ["SGLang"]
-    + ["TRTLLM"]
+    + ["TRTLLM-Decode"]
+    + ["TRTLLM-Prefill"]
     + ["FlashInfer"]
     + ["TLE"]
     + (["TileLang"] if _HAVE_TILELANG else [])
@@ -2427,6 +2489,7 @@ _BENCH_STYLES = (
     + [("red", "-")]
     + [("purple", "-")]
     + [("black", "-")]
+    + [("brown", "-")]
     + [("gray", "-")]
     + [("orange", "-")]
     + ([("blue", "-")] if _HAVE_TILELANG else [])
@@ -2501,7 +2564,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
                 assume_aligned=assume_aligned,
             )
 
-    elif provider == "trtllm-cuda":
+    elif provider == "trtllm-decode":
         if _load_embedded_trtllm_indexer_topk() is None:
             raise RuntimeError("TRT-LLM indexerTopK extension unavailable")
         trtllm_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
@@ -2509,7 +2572,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
         trtllm_out_indices_aux = torch.empty((batch, 10 * topk), dtype=torch.int32, device=x.device)
 
         def run():
-            trtllm_cuda_topk_selector(
+            trtllm_cuda_topk_selector_decode(
                 x,
                 starts,
                 ends,
@@ -2517,6 +2580,20 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
                 out=trtllm_out,
                 out_logits_aux=trtllm_out_logits_aux,
                 out_indices_aux=trtllm_out_indices_aux,
+            )
+
+    elif provider == "trtllm-prefill":
+        if _load_embedded_trtllm_indexer_topk() is None:
+            raise RuntimeError("TRT-LLM indexerTopK extension unavailable")
+        trtllm_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
+
+        def run():
+            trtllm_cuda_topk_selector_prefill(
+                x,
+                starts,
+                ends,
+                topk,
+                out=trtllm_out,
             )
 
     elif provider == "flashinfer-cuda":
@@ -2607,7 +2684,7 @@ def run_correctness(batch, seq_len, topk, block_size):
 
     trtllm_fn = _load_embedded_trtllm_indexer_topk()
     if trtllm_fn is not None:
-        trtllm_out = trtllm_cuda_topk_selector(x, starts, ends, topk)
+        trtllm_out = trtllm_cuda_topk_selector_decode(x, starts, ends, topk)
         print(f"TRTLLM-CUDA-Decode recall vs torch.topk: {_recall(trtllm_out, ref):.4f}")
         print(f"TRTLLM-CUDA-Decode recall vs Triton: {_recall(trtllm_out, triton_out):.4f}")
     else:
@@ -2662,6 +2739,7 @@ def _parse_providers(raw):
     providers = [p.strip() for p in raw.split(",") if p.strip()]
     if not providers:
         raise ValueError("--providers produced empty set")
+    providers = ["trtllm-decode" if p == "trtllm-cuda" else p for p in providers]
     unknown = [p for p in providers if p not in _BENCH_PROVIDERS]
     if unknown:
         raise ValueError(f"unknown providers: {unknown}, supported={list(_BENCH_PROVIDERS)}")
@@ -2726,7 +2804,7 @@ def main(argv=None):
         "--providers",
         type=str,
         default="",
-        help="comma-separated providers for benchmark, e.g. tle,triton,trtllm-cuda",
+        help="comma-separated providers for benchmark, e.g. tle,triton,trtllm-decode,trtllm-prefill",
     )
     parser.add_argument(
         "--bench_x_vals",
