@@ -145,7 +145,6 @@ def processHistogramStep(
     lane = tl.arange(0, BLOCK_SIZE)
     vec = tl.arange(0, VEC)
     ones = tl.full([BLOCK_SIZE], 1, tl.int32)
-    ones_vec_1d = tl.full([BLOCK_SIZE * VEC], 1, tl.int32)
     ones_vec_2d = tl.full([BLOCK_SIZE, VEC], 1, tl.int32)
     zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
     zeros_vec_2d = tl.zeros([BLOCK_SIZE, VEC], dtype=tl.int32)
@@ -174,10 +173,9 @@ def processHistogramStep(
             base = t * BLOCK_SIZE * VEC + lane * VEC
             offs = base[:, None] + vec[None, :]
             x_vec = tl.load(row_ptr + offs)
-            x = tl.reshape(x_vec, [BLOCK_SIZE * VEC])
-            key = _convert_to_trt_uint32(x)
+            key = _convert_to_trt_uint32(x_vec)
             if step_idx == 0:
-                digit = _convert_to_trt_uint16_hi11(x)
+                digit = _convert_to_trt_uint16_hi11(x_vec)
             elif step_idx == 1:
                 digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
             elif step_idx == 2:
@@ -186,7 +184,7 @@ def processHistogramStep(
                 digit = (key & RADIX10_MASK).to(tl.int32)
 
             if step_idx < 2:
-                partial = tl.full([BLOCK_SIZE * VEC], True, tl.int1)
+                partial = tl.full([BLOCK_SIZE, VEC], True, tl.int1)
             elif step_idx == 2:
                 partial = ((key ^ logit_pattern) >> 21) == 0
             else:
@@ -194,7 +192,7 @@ def processHistogramStep(
 
             tl.atomic_add(
                 hist_base_ptr + digit,
-                ones_vec_1d,
+                ones_vec_2d,
                 mask=partial,
                 sem="relaxed",
                 scope="cta",
@@ -264,7 +262,7 @@ def processHistogramStep(
     threshold_bin_ptrs = s_threshold_bin_idx_ptr + zeros
     final_bin_size_ptrs = s_final_bin_size_ptr + zeros
     last_value = found_topk_values
-    threshold_found = tl.full((), False, dtype=tl.int1)
+    threshold_found = False
     threshold_rounds = tl.where(
         step_idx == 3,
         RADIX10_SIZE // BLOCK_SIZE,
@@ -509,15 +507,15 @@ def processHistogramStep(
 
     if step_idx < 3:
         if use_final:
-            need_final_sort = tl.full((), True, dtype=tl.int1)
-            continue_to_next_step = tl.full((), False, dtype=tl.int1)
+            need_final_sort = True
+            continue_to_next_step = False
         else:
-            need_final_sort = tl.full((), False, dtype=tl.int1)
-            continue_to_next_step = tl.full((), True, dtype=tl.int1)
+            need_final_sort = False
+            continue_to_next_step = True
     else:
         tl.store(s_found_topk_values_ptr, TOPK)
-        need_final_sort = tl.full((), False, dtype=tl.int1)
-        continue_to_next_step = tl.full((), False, dtype=tl.int1)
+        need_final_sort = False
+        continue_to_next_step = False
 
     tl.debug_barrier()
     return continue_to_next_step, need_final_sort, logit_pattern
@@ -636,9 +634,9 @@ def tle_topk_selector_kernel(
     tl.store(s_final_bin_size_ptr, 0)
     tl.store(s_found_topk_values_ptr, 0)
 
-    logit_pattern = tl.full((), 0, dtype=tl.uint32)
-    continue_to_next_step = tl.full((), True, dtype=tl.int1)
-    need_final_sort = tl.full((), False, dtype=tl.int1)
+    logit_pattern = tl.zeros((), dtype=tl.uint32)
+    continue_to_next_step = True
+    need_final_sort = False
     init_chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
     for init_idx in tl.range(0, init_chunks):
         pos = init_idx * BLOCK_SIZE + lane
@@ -675,8 +673,8 @@ def tle_topk_selector_kernel(
         # Guard against stale/oversized counts to avoid out-of-bounds accesses
         # in the shared-memory final buffers.
         final_cnt = tl.minimum(tl.load(s_final_cnt_ptr), FINAL_SORT_ITEMS)
-        sort_chunks: tl.constexpr = (FINAL_SORT_ITEMS + BLOCK_SIZE - 1) // BLOCK_SIZE
-        for sort_chunk in tl.static_range(sort_chunks):
+        sort_chunks = tl.cdiv(final_cnt, BLOCK_SIZE)
+        for sort_chunk in tl.range(0, sort_chunks):
             pos = sort_chunk * BLOCK_SIZE + lane
             valid = pos < final_cnt
             idx_i = tl.load(
@@ -863,7 +861,7 @@ def processHistogramStep_compact(
     threshold_bin_ptrs = s_threshold_bin_idx_ptr + zeros
     final_bin_size_ptrs = s_final_bin_size_ptr + zeros
     last_value = found_topk_values
-    threshold_found = tl.full((), False, dtype=tl.int1)
+    threshold_found = False
     threshold_rounds = tl.where(
         step_idx == 3,
         RADIX10_SIZE // BLOCK_SIZE,
@@ -1275,20 +1273,20 @@ def processHistogramStep_compact(
 
     if step_idx < 3:
         if use_final:
-            need_final_sort = tl.full((), True, dtype=tl.int1)
-            continue_to_next_step = tl.full((), False, dtype=tl.int1)
+            need_final_sort = True
+            continue_to_next_step = False
         elif step_idx == 0:
             next_cnt = tl.minimum(tl.load(s_cand_count_ptr), CAND_BUF_SIZE)
             tl.store(s_cand_count_ptr, next_cnt)
-            need_final_sort = tl.full((), False, dtype=tl.int1)
+            need_final_sort = False
             continue_to_next_step = next_cnt > 0
         else:
-            need_final_sort = tl.full((), False, dtype=tl.int1)
+            need_final_sort = False
             continue_to_next_step = tl.load(s_found_topk_values_ptr) < TOPK
     else:
         tl.store(s_found_topk_values_ptr, TOPK)
-        need_final_sort = tl.full((), False, dtype=tl.int1)
-        continue_to_next_step = tl.full((), False, dtype=tl.int1)
+        need_final_sort = False
+        continue_to_next_step = False
 
     tl.debug_barrier()
     return continue_to_next_step, need_final_sort, logit_pattern
@@ -1426,9 +1424,9 @@ def tle_topk_selector_kernel_compact(
         pos = init_idx * BLOCK_SIZE + lane
         tl.store(s_out_indices_ptr + pos, -1, mask=pos < TOPK)
 
-    need_final_sort = tl.full((), False, dtype=tl.int1)
-    continue_to_next_step = tl.full((), True, dtype=tl.int1)
-    logit_pattern = tl.full((), 0, dtype=tl.uint32)
+    need_final_sort = False
+    continue_to_next_step = True
+    logit_pattern = tl.zeros((), dtype=tl.uint32)
     for step_idx in tl.range(0, 4):
         if continue_to_next_step:
             cand_count = tl.load(s_cand_cnt_ptr)
@@ -1463,8 +1461,8 @@ def tle_topk_selector_kernel_compact(
         found_topk_values = tl.load(s_found_topk_values_ptr)
         remaining = TOPK - found_topk_values
         final_cnt = tl.minimum(tl.load(s_final_cnt_ptr), FINAL_SORT_ITEMS)
-        sort_chunks: tl.constexpr = (FINAL_SORT_ITEMS + BLOCK_SIZE - 1) // BLOCK_SIZE
-        for sort_chunk in tl.static_range(sort_chunks):
+        sort_chunks = tl.cdiv(final_cnt, BLOCK_SIZE)
+        for sort_chunk in tl.range(0, sort_chunks):
             pos = sort_chunk * BLOCK_SIZE + lane
             valid = pos < final_cnt
             idx_i = tl.load(
@@ -1551,13 +1549,13 @@ def triton_topk_selector_kernel(
         coarse_counts = coarse_counts + tl.histogram(digit8, RADIX_SIZE, mask=in_range)
 
     coarse_cumsum_desc = tl.cumsum(coarse_counts, axis=0, reverse=True)
-    topk_target = tl.full((), TOPK, tl.int32)
+    topk_target = TOPK
     coarse_cond = coarse_cumsum_desc > topk_target
     coarse_threshold_bin = tl.max(tl.where(coarse_cond, bins, 0), axis=0).to(tl.int32)
     coarse_counts_gt = tl.max(tl.where(bins == (coarse_threshold_bin + 1), coarse_cumsum_desc, 0), axis=0)
     new_topk = topk_target - coarse_counts_gt
-    write_count = tl.full((), 0, tl.int32)
-    cand_count0 = tl.full((), 0, tl.int32)
+    write_count = 0
+    cand_count0 = 0
 
     # Stage 2: write coarse winners and compact coarse-threshold candidates into cand0.
     for t in tl.range(0, n_tiles):
@@ -1583,8 +1581,9 @@ def triton_topk_selector_kernel(
     for round_idx in tl.static_range(4):
         if (new_topk > 0) & (num_in > 0):
             shift: tl.constexpr = 24 - round_idx * 8
-            desired = tl.full((), 0, tl.uint32)
-            desired_mask = tl.full((), 0, tl.uint32)
+            desired = tl.zeros((), dtype=tl.uint32)
+            desired_mask = tl.zeros((), dtype=tl.uint32)
+            radix_mask_u32 = tl.zeros((), dtype=tl.uint32) + RADIX_MASK
             k_to_find = new_topk
             num_in_tiles = tl.cdiv(num_in, BLOCK_SIZE)
             counts = tl.zeros([RADIX_SIZE], dtype=tl.int32)
@@ -1609,11 +1608,11 @@ def triton_topk_selector_kernel(
             threshold_bin = tl.max(tl.where(cond, bins, 0), axis=0).to(tl.int32)
             counts_gt = tl.max(tl.where(bins == (threshold_bin + 1), cumsum_desc, 0), axis=0)
             desired = desired | (threshold_bin.to(tl.uint32) << shift)
-            desired_mask = desired_mask | (tl.full((), RADIX_MASK, tl.uint32) << shift)
+            desired_mask = desired_mask | (radix_mask_u32 << shift)
             new_topk = k_to_find - counts_gt
 
             out_count = write_count
-            next_count = tl.full((), 0, tl.int32)
+            next_count = 0
             for t in tl.range(0, num_in_tiles):
                 pos = t * BLOCK_SIZE + lane
                 valid = pos < num_in
