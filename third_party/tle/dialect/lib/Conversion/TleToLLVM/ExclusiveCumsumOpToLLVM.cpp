@@ -371,6 +371,10 @@ struct ExclusiveCumsumOpConversion
                                            "unsupported sub in ordered exclusive");
       targetInfo.storeShared(rewriter, loc, orderedPtr, exclusiveOrdered,
                              activeOrdered);
+      // The gather below reads by logical index (reverse remap may read values
+      // produced by different threads/warps). Ensure all ordered exclusive
+      // stores are visible before any thread starts loading gathered values.
+      targetInfo.barrier(loc, rewriter);
 
       SmallVector<Value> exclusiveVals;
       exclusiveVals.reserve(inputVals.size());

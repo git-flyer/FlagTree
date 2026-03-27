@@ -131,8 +131,11 @@ def _entry_block(ptx: str) -> str:
         (torch.int8, 511, 512, False, 16),
         (torch.int16, 257, 512, False, 16),
         (torch.int32, 512, 512, False, 16),
+        (torch.int32, 256, 256, True, 8),
+        (torch.int32, 512, 512, True, 16),
         (torch.float16, 127, 128, False, 4),
         (torch.float32, 128, 128, True, 4),
+        (torch.float32, 512, 512, True, 16),
         (torch.bfloat16, 193, 256, False, 8),
     ],
 )
@@ -166,7 +169,11 @@ def test_tle_cumsum_exclusive_and_total(dtype, n, block, reverse, num_warps):
         torch.testing.assert_close(exclusive[:n], expected_exclusive, atol=2e-2, rtol=2e-2)
         torch.testing.assert_close(total[0], expected_total, atol=2e-2, rtol=2e-2)
     elif out_dtype == torch.float32:
-        torch.testing.assert_close(exclusive[:n], expected_exclusive, atol=2e-6, rtol=1e-5)
+        # GPU parallel scan accumulation order differs from torch's sequential
+        # cumsum reference, especially in reverse mode.
+        atol = 1e-5 if reverse else 2e-6
+        rtol = 5e-4 if reverse else 1e-5
+        torch.testing.assert_close(exclusive[:n], expected_exclusive, atol=atol, rtol=rtol)
         torch.testing.assert_close(total[0], expected_total, atol=2e-6, rtol=1e-5)
     else:
         torch.testing.assert_close(exclusive[:n], expected_exclusive)
