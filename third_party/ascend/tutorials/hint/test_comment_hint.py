@@ -32,7 +32,7 @@ This verifies that:
 import triton
 import triton.language as tl
 from triton.compiler.compiler import ASTSource
-from triton.compiler.code_generator import ast_to_ttir
+from triton.backends.ascend.spec.triton.compiler.code_generator import ast_to_ttir
 from triton._C.libtriton import ir, ascend
 from triton._C.libtriton.ascend import ir as ascend_ir
 from triton.backends.ascend.compiler import NPUOptions, min_dot_size
