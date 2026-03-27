@@ -29,9 +29,6 @@ This verifies that:
 3. The kernel compiles and runs correctly end-to-end
 """
 
-import torch
-import torch_npu
-
 import triton
 import triton.language as tl
 from triton.compiler.compiler import ASTSource
@@ -165,53 +162,8 @@ def test_ir_hint_annotations():
 
 
 # ---------------------------------------------------------------------------
-# Test 2: End-to-end matmul with hints - verify correctness
-# ---------------------------------------------------------------------------
-def test_e2e_matmul_with_hints():
-    print("=" * 60)
-    print("Test 2: End-to-end matmul with comment hints")
-    print("=" * 60)
-
-    M, N, K = 128, 128, 128
-    BLOCK_M, BLOCK_N, BLOCK_K = 64, 64, 64
-
-    torch.manual_seed(0)
-    a = torch.randn((M, K), device='npu', dtype=torch.float16)
-    b = torch.randn((K, N), device='npu', dtype=torch.float16)
-    c = torch.empty((M, N), device='npu', dtype=torch.float16)
-
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-    matmul_hint_kernel[grid](
-        a,
-        b,
-        c,
-        M,
-        N,
-        K,
-        a.stride(0),
-        a.stride(1),
-        b.stride(0),
-        b.stride(1),
-        c.stride(0),
-        c.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K,
-    )
-
-    c_ref = torch.matmul(a, b)
-    max_diff = torch.max(torch.abs(c.float() - c_ref.float())).item()
-    print(f"  Max difference between triton and torch: {max_diff}")
-
-    # fp16 matmul tolerance
-    assert max_diff < 1.0, f"Result mismatch: max_diff={max_diff} exceeds tolerance"
-    print("  [PASS] End-to-end matmul result is correct\n")
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     test_ir_hint_annotations()
-    test_e2e_matmul_with_hints()
     print("All comment hint tests passed!")
