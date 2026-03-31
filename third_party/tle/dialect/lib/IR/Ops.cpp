@@ -534,18 +534,24 @@ LogicalResult DistributedBarrierOp::verify() {
 }
 
 LogicalResult RemotePointersOp::verify() {
-  auto srcTy = dyn_cast<RankedTensorType>(getSrc().getType());
-  if (!srcTy)
-    return emitOpError() << "expects src operand to be a ranked tensor";
-  auto resultTy = dyn_cast<RankedTensorType>(getResult().getType());
-  if (!resultTy)
-    return emitOpError() << "expects result to be a ranked tensor";
+  Type srcTy = getSrc().getType();
+  Type resultTy = getResult().getType();
   if (srcTy != resultTy)
     return emitOpError() << "expects result type to match src type";
 
-  auto ptrTy = dyn_cast<triton::PointerType>(srcTy.getElementType());
-  if (!ptrTy)
-    return emitOpError() << "expects src/result element type to be tt.ptr";
+  triton::PointerType ptrTy;
+  if (auto srcTensorTy = dyn_cast<RankedTensorType>(srcTy)) {
+    ptrTy = dyn_cast<triton::PointerType>(srcTensorTy.getElementType());
+    if (!ptrTy)
+      return emitOpError() << "expects tensor src/result element type to be "
+                              "tt.ptr";
+  } else if (auto srcPtrTy = dyn_cast<triton::PointerType>(srcTy)) {
+    ptrTy = srcPtrTy;
+  } else {
+    return emitOpError() << "expects src/result to be tensor<tt.ptr<...>> or "
+                            "tt.ptr";
+  }
+
   if (ptrTy.getAddressSpace() != kSharedMemoryAddressSpace)
     return emitOpError() << "expects pointers to live in shared memory";
 

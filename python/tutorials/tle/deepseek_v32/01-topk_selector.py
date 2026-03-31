@@ -44,14 +44,16 @@ except Exception:  # pragma: no cover - optional dependency
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 RADIX_BITS = 8
 RADIX = 1 << RADIX_BITS
-TLE_FIXED_BLOCK_SIZE = 512
+TLE_FIXED_BLOCK_SIZE = 1024
 TLE_FIXED_NUM_WARPS = TLE_FIXED_BLOCK_SIZE // 32
 TLE_FIXED_NUM_STAGES = 1
 TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD = 12288
-TLE_FILTERED_BLOCK_SIZE = 1024
-TLE_FILTERED_NUM_WARPS = TLE_FILTERED_BLOCK_SIZE // 32
-TLE_FILTERED_NUM_STAGES = 1
-TLE_FILTERED_CAND_BUF_SIZE = 4096
+TLE_SMEM_BLOCK_SIZE = 1024
+TLE_SMEM_NUM_WARPS = TLE_SMEM_BLOCK_SIZE // 32
+TLE_SMEM_NUM_STAGES = 1
+TLE_SMEM_INPUT_SIZE = 4096
+TLE_SMEM_CLUSTER_SIZE = 8
+BLOCK_CLUSTER_MESH_8 = tle.device_mesh({"block_cluster": [("cluster_x", TLE_SMEM_CLUSTER_SIZE)]})
 
 
 # %%
@@ -848,7 +850,7 @@ def tle_topk_selector_kernel(
 
 
 @triton.jit
-def _tle_topk_filtered_fallback_fullscan(
+def _tle_topk_smem_overflow_fallback_fullscan(
     row_ptr,
     out_row,
     stride_xn,
@@ -1046,7 +1048,553 @@ def _tle_topk_filtered_fallback_fullscan(
 
 
 @triton.jit
-def tle_topk_selector_kernel_filtered(
+def _tle_process_histogram_step_smem(
+    row_ptr,
+    stride_xn,
+    row_start,
+    row_end,
+    seq_len,
+    step_idx,
+    found_topk_values,
+    hist_base_ptr,
+    s_out_indices_ptr,
+    s_final_cnt_ptr,
+    s_found_topk_values_ptr,
+    s_threshold_bin_idx_ptr,
+    s_final_bin_size_ptr,
+    src_idx_ptr,
+    src_val_ptr,
+    src_count_ptr,
+    dst_idx_ptr,
+    dst_val_ptr,
+    dst_count_ptr,
+    s_need_fallback_ptr,
+    ASSUME_ALIGNED: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SMEM_INPUT_SIZE: tl.constexpr,
+):
+    VEC: tl.constexpr = 4
+    FINAL_SORT_ITEMS: tl.constexpr = 2048
+    RADIX11_SIZE: tl.constexpr = 2048
+    RADIX11_MASK: tl.constexpr = 0x7FF
+    RADIX10_SIZE: tl.constexpr = 1024
+    RADIX10_MASK: tl.constexpr = 0x3FF
+
+    lane = tl.arange(0, BLOCK_SIZE)
+    vec = tl.arange(0, VEC)
+    ones = tl.full([BLOCK_SIZE], 1, tl.int32)
+    ones_vec_2d = tl.full([BLOCK_SIZE, VEC], 1, tl.int32)
+    zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    zeros_vec_2d = tl.zeros([BLOCK_SIZE, VEC], dtype=tl.int32)
+
+    clear_rounds = tl.where(step_idx == 2, RADIX10_SIZE // BLOCK_SIZE, RADIX11_SIZE // BLOCK_SIZE)
+    threshold_rounds = clear_rounds
+
+    for clear_round in tl.range(0, clear_rounds):
+        clear_bins = clear_round * BLOCK_SIZE + lane
+        tl.store(hist_base_ptr + clear_bins, 0)
+
+    if step_idx == 0:
+        if ASSUME_ALIGNED:
+            n_vec_full = seq_len // (BLOCK_SIZE * VEC)
+            rem_tiles = (seq_len - n_vec_full * BLOCK_SIZE * VEC) // BLOCK_SIZE
+
+            for t in tl.range(0, n_vec_full):
+                base = t * BLOCK_SIZE * VEC + lane * VEC
+                offs = base[:, None] + vec[None, :]
+                x_vec = tl.load(row_ptr + offs)
+                key = _convert_to_trt_uint32(x_vec)
+                digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+                tl.atomic_add(
+                    hist_base_ptr + digit,
+                    ones_vec_2d,
+                    sem="relaxed",
+                    scope="cta",
+                )
+
+            for t in tl.range(0, rem_tiles):
+                offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
+                x = tl.load(row_ptr + offs)
+                key = _convert_to_trt_uint32(x)
+                digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+                tl.atomic_add(
+                    hist_base_ptr + digit,
+                    ones,
+                    sem="relaxed",
+                    scope="cta",
+                )
+        else:
+            n_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
+            for t in tl.range(0, n_tiles):
+                offs = t * BLOCK_SIZE + lane
+                valid = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+                x = tl.load(row_ptr + offs * stride_xn, mask=valid, other=float("-inf"))
+                key = _convert_to_trt_uint32(x)
+                digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+                tl.atomic_add(
+                    hist_base_ptr + digit,
+                    ones,
+                    mask=valid,
+                    sem="relaxed",
+                    scope="cta",
+                )
+    else:
+        src_count = tl.minimum(tl.load(src_count_ptr), SMEM_INPUT_SIZE)
+        src_vec_full = src_count // (BLOCK_SIZE * VEC)
+        vec_processed = src_vec_full * BLOCK_SIZE * VEC
+        src_tail_tiles = tl.cdiv(src_count - vec_processed, BLOCK_SIZE)
+
+        for t in tl.range(0, src_vec_full):
+            base = t * BLOCK_SIZE * VEC + lane * VEC
+            pos = base[:, None] + vec[None, :]
+            val_bits_vec = tl.load(src_val_ptr + pos)
+            x_vec = val_bits_vec.to(tl.float32, bitcast=True)
+            key = _convert_to_trt_uint32(x_vec)
+            if step_idx == 1:
+                digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+            else:
+                digit = (key & RADIX10_MASK).to(tl.int32)
+            tl.atomic_add(
+                hist_base_ptr + digit,
+                ones_vec_2d,
+                sem="relaxed",
+                scope="cta",
+            )
+
+        for t in tl.range(0, src_tail_tiles):
+            pos = vec_processed + t * BLOCK_SIZE + lane
+            valid = pos < src_count
+            val_bits = tl.load(src_val_ptr + pos, mask=valid, other=0)
+            x = val_bits.to(tl.float32, bitcast=True)
+            key = _convert_to_trt_uint32(x)
+            if step_idx == 1:
+                digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+            else:
+                digit = (key & RADIX10_MASK).to(tl.int32)
+            tl.atomic_add(
+                hist_base_ptr + digit,
+                ones,
+                mask=valid,
+                sem="relaxed",
+                scope="cta",
+            )
+    tl.debug_barrier()
+
+    tl.store(s_threshold_bin_idx_ptr, -1)
+    tl.store(s_final_bin_size_ptr, 0)
+    threshold_bin_ptrs = s_threshold_bin_idx_ptr + zeros
+    final_bin_size_ptrs = s_final_bin_size_ptr + zeros
+    last_value = found_topk_values
+    threshold_found = False
+    for round_idx in tl.range(0, threshold_rounds):
+        if not threshold_found:
+            bins = round_idx * BLOCK_SIZE + lane
+            counts = tl.load(hist_base_ptr + bins)
+            prefix_sum, counts_total = tle.cumsum(counts, axis=0, reverse=False)
+            prefix_sum = prefix_sum + last_value
+            total_sum = last_value + counts_total
+            next_prefix_sum = prefix_sum + counts
+            threshold_mask = (prefix_sum < TOPK) & (next_prefix_sum >= TOPK)
+            threshold_bin = bins
+            threshold_bin_size = next_prefix_sum - prefix_sum
+            tl.store(threshold_bin_ptrs, threshold_bin, mask=threshold_mask)
+            tl.store(final_bin_size_ptrs, threshold_bin_size, mask=threshold_mask)
+            found_round = tl.reduce_or(threshold_mask, axis=0)
+            threshold_found = found_round
+            last_value = total_sum
+
+    tl.debug_barrier()
+    threshold_bin_idx = tl.load(s_threshold_bin_idx_ptr)
+    final_bin_size = tl.load(s_final_bin_size_ptr)
+    use_final = (step_idx < 2) & (threshold_bin_idx >= 0) & (final_bin_size <= FINAL_SORT_ITEMS)
+    if use_final:
+        tl.store(s_final_cnt_ptr, 0)
+    elif step_idx < 2:
+        tl.store(dst_count_ptr, 0)
+
+    found_ptrs = s_found_topk_values_ptr + zeros
+    found_ptrs_vec_2d = s_found_topk_values_ptr + zeros_vec_2d
+    final_cnt_ptrs = s_final_cnt_ptr + zeros
+    final_cnt_ptrs_vec_2d = s_final_cnt_ptr + zeros_vec_2d
+    dst_count_ptrs = dst_count_ptr + zeros
+    dst_count_ptrs_vec_2d = dst_count_ptr + zeros_vec_2d
+    fallback_ptrs = s_need_fallback_ptr + zeros
+    fallback_ptrs_vec_2d = s_need_fallback_ptr + zeros_vec_2d
+
+    if step_idx == 0:
+        if ASSUME_ALIGNED:
+            n_vec_full = seq_len // (BLOCK_SIZE * VEC)
+            rem_tiles = (seq_len - n_vec_full * BLOCK_SIZE * VEC) // BLOCK_SIZE
+
+            for t in tl.range(0, n_vec_full):
+                base = t * BLOCK_SIZE * VEC + lane * VEC
+                offs = base[:, None] + vec[None, :]
+                idx = offs.to(tl.int32)
+                x_vec = tl.load(row_ptr + offs)
+                key = _convert_to_trt_uint32(x_vec)
+                digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+
+                take_lt = digit < threshold_bin_idx
+                out_pos_lt = tl.atomic_add(
+                    found_ptrs_vec_2d,
+                    ones_vec_2d,
+                    mask=take_lt,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(
+                    s_out_indices_ptr + out_pos_lt,
+                    idx,
+                    mask=take_lt & (out_pos_lt < TOPK),
+                )
+
+                if use_final:
+                    take_eq_final = digit == threshold_bin_idx
+                    final_pos = tl.atomic_add(
+                        final_cnt_ptrs_vec_2d,
+                        ones_vec_2d,
+                        mask=take_eq_final,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    tl.store(
+                        hist_base_ptr + final_pos,
+                        idx,
+                        mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                    )
+                    tl.store(
+                        hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
+                        x_vec.to(tl.int32, bitcast=True),
+                        mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                    )
+                elif step_idx < 2:
+                    take_eq_next = digit == threshold_bin_idx
+                    dst_pos = tl.atomic_add(
+                        dst_count_ptrs_vec_2d,
+                        ones_vec_2d,
+                        mask=take_eq_next,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                    tl.store(dst_idx_ptr + dst_pos, idx, mask=keep_eq)
+                    tl.store(dst_val_ptr + dst_pos, x_vec.to(tl.int32, bitcast=True), mask=keep_eq)
+                    overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                    tl.atomic_or(
+                        fallback_ptrs_vec_2d,
+                        ones_vec_2d,
+                        mask=overflow_mask,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+
+            for t in tl.range(0, rem_tiles):
+                offs = (n_vec_full * VEC + t) * BLOCK_SIZE + lane
+                idx = offs.to(tl.int32)
+                x = tl.load(row_ptr + offs)
+                key = _convert_to_trt_uint32(x)
+                digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+
+                take_lt = digit < threshold_bin_idx
+                out_pos_lt = tl.atomic_add(
+                    found_ptrs,
+                    ones,
+                    mask=take_lt,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(
+                    s_out_indices_ptr + out_pos_lt,
+                    idx,
+                    mask=take_lt & (out_pos_lt < TOPK),
+                )
+
+                if use_final:
+                    take_eq_final = digit == threshold_bin_idx
+                    final_pos = tl.atomic_add(
+                        final_cnt_ptrs,
+                        ones,
+                        mask=take_eq_final,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    tl.store(
+                        hist_base_ptr + final_pos,
+                        idx,
+                        mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                    )
+                    tl.store(
+                        hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
+                        x.to(tl.int32, bitcast=True),
+                        mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                    )
+                elif step_idx < 2:
+                    take_eq_next = digit == threshold_bin_idx
+                    dst_pos = tl.atomic_add(
+                        dst_count_ptrs,
+                        ones,
+                        mask=take_eq_next,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                    tl.store(dst_idx_ptr + dst_pos, idx, mask=keep_eq)
+                    tl.store(dst_val_ptr + dst_pos, x.to(tl.int32, bitcast=True), mask=keep_eq)
+                    overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                    tl.atomic_or(
+                        fallback_ptrs,
+                        ones,
+                        mask=overflow_mask,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+        else:
+            n_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
+            for t in tl.range(0, n_tiles):
+                offs = t * BLOCK_SIZE + lane
+                valid = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+                idx = offs.to(tl.int32)
+                x = tl.load(row_ptr + offs * stride_xn, mask=valid, other=float("-inf"))
+                key = _convert_to_trt_uint32(x)
+                digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+
+                take_lt = valid & (digit < threshold_bin_idx)
+                out_pos_lt = tl.atomic_add(
+                    found_ptrs,
+                    ones,
+                    mask=take_lt,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(
+                    s_out_indices_ptr + out_pos_lt,
+                    idx,
+                    mask=take_lt & (out_pos_lt < TOPK),
+                )
+
+                if use_final:
+                    take_eq_final = valid & (digit == threshold_bin_idx)
+                    final_pos = tl.atomic_add(
+                        final_cnt_ptrs,
+                        ones,
+                        mask=take_eq_final,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    tl.store(
+                        hist_base_ptr + final_pos,
+                        idx,
+                        mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                    )
+                    tl.store(
+                        hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
+                        x.to(tl.int32, bitcast=True),
+                        mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                    )
+                elif step_idx < 2:
+                    take_eq_next = valid & (digit == threshold_bin_idx)
+                    dst_pos = tl.atomic_add(
+                        dst_count_ptrs,
+                        ones,
+                        mask=take_eq_next,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                    tl.store(dst_idx_ptr + dst_pos, idx, mask=keep_eq)
+                    tl.store(dst_val_ptr + dst_pos, x.to(tl.int32, bitcast=True), mask=keep_eq)
+                    overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                    tl.atomic_or(
+                        fallback_ptrs,
+                        ones,
+                        mask=overflow_mask,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+    else:
+        src_count = tl.minimum(tl.load(src_count_ptr), SMEM_INPUT_SIZE)
+        src_vec_full = src_count // (BLOCK_SIZE * VEC)
+        vec_processed = src_vec_full * BLOCK_SIZE * VEC
+        src_tail_tiles = tl.cdiv(src_count - vec_processed, BLOCK_SIZE)
+
+        for t in tl.range(0, src_vec_full):
+            base = t * BLOCK_SIZE * VEC + lane * VEC
+            pos = base[:, None] + vec[None, :]
+            idx = tl.load(src_idx_ptr + pos)
+            val_bits_vec = tl.load(src_val_ptr + pos)
+            x_vec = val_bits_vec.to(tl.float32, bitcast=True)
+            key = _convert_to_trt_uint32(x_vec)
+            if step_idx == 1:
+                digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+            else:
+                digit = (key & RADIX10_MASK).to(tl.int32)
+
+            take_lt = digit < threshold_bin_idx
+            out_pos_lt = tl.atomic_add(
+                found_ptrs_vec_2d,
+                ones_vec_2d,
+                mask=take_lt,
+                sem="relaxed",
+                scope="cta",
+            )
+            tl.store(
+                s_out_indices_ptr + out_pos_lt,
+                idx.to(tl.int32),
+                mask=take_lt & (out_pos_lt < TOPK),
+            )
+
+            if step_idx == 2:
+                take_eq = digit == threshold_bin_idx
+                out_pos_eq = tl.atomic_add(
+                    found_ptrs_vec_2d,
+                    ones_vec_2d,
+                    mask=take_eq,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(
+                    s_out_indices_ptr + out_pos_eq,
+                    idx.to(tl.int32),
+                    mask=take_eq & (out_pos_eq < TOPK),
+                )
+            elif use_final:
+                take_eq_final = digit == threshold_bin_idx
+                final_pos = tl.atomic_add(
+                    final_cnt_ptrs_vec_2d,
+                    ones_vec_2d,
+                    mask=take_eq_final,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(
+                    hist_base_ptr + final_pos,
+                    idx.to(tl.int32),
+                    mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                )
+                tl.store(
+                    hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
+                    x_vec.to(tl.int32, bitcast=True),
+                    mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                )
+            elif step_idx < 2:
+                take_eq_next = digit == threshold_bin_idx
+                dst_pos = tl.atomic_add(
+                    dst_count_ptrs_vec_2d,
+                    ones_vec_2d,
+                    mask=take_eq_next,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                tl.store(dst_idx_ptr + dst_pos, idx.to(tl.int32), mask=keep_eq)
+                tl.store(dst_val_ptr + dst_pos, val_bits_vec, mask=keep_eq)
+                overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                tl.atomic_or(
+                    fallback_ptrs_vec_2d,
+                    ones_vec_2d,
+                    mask=overflow_mask,
+                    sem="relaxed",
+                    scope="cta",
+                )
+
+        for t in tl.range(0, src_tail_tiles):
+            pos = vec_processed + t * BLOCK_SIZE + lane
+            valid = pos < src_count
+            idx = tl.load(src_idx_ptr + pos, mask=valid, other=0)
+            val_bits = tl.load(src_val_ptr + pos, mask=valid, other=0)
+            x = val_bits.to(tl.float32, bitcast=True)
+            key = _convert_to_trt_uint32(x)
+            if step_idx == 1:
+                digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+            else:
+                digit = (key & RADIX10_MASK).to(tl.int32)
+
+            take_lt = valid & (digit < threshold_bin_idx)
+            out_pos_lt = tl.atomic_add(
+                found_ptrs,
+                ones,
+                mask=take_lt,
+                sem="relaxed",
+                scope="cta",
+            )
+            tl.store(
+                s_out_indices_ptr + out_pos_lt,
+                idx.to(tl.int32),
+                mask=take_lt & (out_pos_lt < TOPK),
+            )
+
+            if step_idx == 2:
+                take_eq = valid & (digit == threshold_bin_idx)
+                out_pos_eq = tl.atomic_add(
+                    found_ptrs,
+                    ones,
+                    mask=take_eq,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(
+                    s_out_indices_ptr + out_pos_eq,
+                    idx.to(tl.int32),
+                    mask=take_eq & (out_pos_eq < TOPK),
+                )
+            elif use_final:
+                take_eq_final = valid & (digit == threshold_bin_idx)
+                final_pos = tl.atomic_add(
+                    final_cnt_ptrs,
+                    ones,
+                    mask=take_eq_final,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                tl.store(
+                    hist_base_ptr + final_pos,
+                    idx.to(tl.int32),
+                    mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                )
+                tl.store(
+                    hist_base_ptr + (FINAL_SORT_ITEMS + final_pos),
+                    x.to(tl.int32, bitcast=True),
+                    mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                )
+            elif step_idx < 2:
+                take_eq_next = valid & (digit == threshold_bin_idx)
+                dst_pos = tl.atomic_add(
+                    dst_count_ptrs,
+                    ones,
+                    mask=take_eq_next,
+                    sem="relaxed",
+                    scope="cta",
+                )
+                keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                tl.store(dst_idx_ptr + dst_pos, idx.to(tl.int32), mask=keep_eq)
+                tl.store(dst_val_ptr + dst_pos, val_bits, mask=keep_eq)
+                overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                tl.atomic_or(
+                    fallback_ptrs,
+                    ones,
+                    mask=overflow_mask,
+                    sem="relaxed",
+                    scope="cta",
+                )
+
+    tl.debug_barrier()
+    if step_idx < 2:
+        if use_final:
+            continue_to_next_step = False
+            need_final_sort = True
+        else:
+            continue_to_next_step = True
+            need_final_sort = False
+    else:
+        tl.store(s_found_topk_values_ptr, TOPK)
+        continue_to_next_step = False
+        need_final_sort = False
+    return continue_to_next_step, need_final_sort
+
+
+@triton.jit
+def tle_topk_selector_kernel_smem(
     x_ptr,
     out_ptr,
     starts_ptr,
@@ -1059,25 +1607,25 @@ def tle_topk_selector_kernel_filtered(
     ASSUME_ALIGNED: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
-    CAND_BUF_SIZE: tl.constexpr,
+    SMEM_INPUT_SIZE: tl.constexpr,
+    USE_RADIX_FINAL: tl.constexpr,
 ):
     pid = tl.program_id(0)
     row_start = tl.load(starts_ptr + pid).to(tl.int32)
     row_end = tl.load(ends_ptr + pid).to(tl.int32)
+
     row_ptr = x_ptr + pid * stride_xm
     out_row = out_ptr + pid * stride_outm
+    row_len = row_end - row_start
 
     if ASSUME_ALIGNED:
         tl.assume(row_start == 0)
         tl.assume(row_end == seq_len)
         tl.assume(stride_xn == 1)
         tl.assume(stride_outn == 1)
+        seq_len = tl.multiple_of(seq_len, BLOCK_SIZE)
 
     lane = tl.arange(0, BLOCK_SIZE)
-    ones = tl.full([BLOCK_SIZE], 1, tl.int32)
-    zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-
-    row_len = row_end - row_start
     if row_len <= TOPK:
         chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
         for chunk_idx in tl.range(0, chunks):
@@ -1088,66 +1636,60 @@ def tle_topk_selector_kernel_filtered(
             tl.store(out_row + pos * stride_outn, -1, mask=take_pad)
         return
 
-    RADIX_SIZE: tl.constexpr = 256
-    CAND_ROUNDS: tl.constexpr = 4
+    FINAL_SORT_ITEMS: tl.constexpr = 2048
+    HIST_SIZE: tl.constexpr = 4096
 
     s_histogram = tle.gpu.alloc(
-        [RADIX_SIZE],
+        [HIST_SIZE],
         dtype=tl.int32,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_cand0_idx = tle.gpu.alloc(
-        [CAND_BUF_SIZE],
+    hist_base_ptr = tle.gpu.local_ptr(s_histogram, (0, ))
+    s_out_indices = tle.gpu.alloc(
+        [TOPK],
         dtype=tl.int32,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_cand1_idx = tle.gpu.alloc(
-        [CAND_BUF_SIZE],
+    s_input_idx0 = tle.gpu.alloc(
+        [SMEM_INPUT_SIZE],
         dtype=tl.int32,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_write_count = tle.gpu.alloc(
+    s_input_idx1 = tle.gpu.alloc(
+        [SMEM_INPUT_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_val0 = tle.gpu.alloc(
+        [SMEM_INPUT_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_val1 = tle.gpu.alloc(
+        [SMEM_INPUT_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_count0 = tle.gpu.alloc(
         [1],
         dtype=tl.int32,
         layout=None,
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
-    s_cand0_count = tle.gpu.alloc(
-        [1],
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_cand1_count = tle.gpu.alloc(
-        [1],
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_eq_count = tle.gpu.alloc(
-        [1],
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_threshold_bin = tle.gpu.alloc(
-        [1],
-        dtype=tl.int32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    s_threshold_counts_gt = tle.gpu.alloc(
+    s_input_count1 = tle.gpu.alloc(
         [1],
         dtype=tl.int32,
         layout=None,
@@ -1161,226 +1703,127 @@ def tle_topk_selector_kernel_filtered(
         scope=tle.gpu.smem,
         nv_mma_shared_layout=False,
     )
+    s_fallback_eq_count = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_final_cnt = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_threshold_bin_idx = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_final_bin_size = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_found_topk_values = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
 
-    hist_base_ptr = tle.gpu.local_ptr(s_histogram, (0, ))
-    s_cand0_idx_ptr = tle.gpu.local_ptr(s_cand0_idx, (0, ))
-    s_cand1_idx_ptr = tle.gpu.local_ptr(s_cand1_idx, (0, ))
-    s_write_count_ptr = tle.gpu.local_ptr(s_write_count, (0, ))
-    s_cand0_count_ptr = tle.gpu.local_ptr(s_cand0_count, (0, ))
-    s_cand1_count_ptr = tle.gpu.local_ptr(s_cand1_count, (0, ))
-    s_eq_count_ptr = tle.gpu.local_ptr(s_eq_count, (0, ))
-    s_threshold_bin_ptr = tle.gpu.local_ptr(s_threshold_bin, (0, ))
-    s_threshold_counts_gt_ptr = tle.gpu.local_ptr(s_threshold_counts_gt, (0, ))
+    s_input_idx0_ptr = tle.gpu.local_ptr(s_input_idx0, (0, ))
+    s_input_idx1_ptr = tle.gpu.local_ptr(s_input_idx1, (0, ))
+    s_input_val0_ptr = tle.gpu.local_ptr(s_input_val0, (0, ))
+    s_input_val1_ptr = tle.gpu.local_ptr(s_input_val1, (0, ))
+    s_input_count0_ptr = tle.gpu.local_ptr(s_input_count0, (0, ))
+    s_input_count1_ptr = tle.gpu.local_ptr(s_input_count1, (0, ))
     s_need_fallback_ptr = tle.gpu.local_ptr(s_need_fallback, (0, ))
+    s_fallback_eq_count_ptr = tle.gpu.local_ptr(s_fallback_eq_count, (0, ))
+    s_final_cnt_ptr = tle.gpu.local_ptr(s_final_cnt, (0, ))
+    s_threshold_bin_idx_ptr = tle.gpu.local_ptr(s_threshold_bin_idx, (0, ))
+    s_final_bin_size_ptr = tle.gpu.local_ptr(s_final_bin_size, (0, ))
+    s_found_topk_values_ptr = tle.gpu.local_ptr(s_found_topk_values, (0, ))
+    s_out_indices_ptr = tle.gpu.local_ptr(s_out_indices, (0, ))
 
-    tl.store(s_write_count_ptr, 0)
-    tl.store(s_cand0_count_ptr, 0)
-    tl.store(s_cand1_count_ptr, 0)
-    tl.store(s_eq_count_ptr, 0)
+    tl.store(s_input_count0_ptr, 0)
+    tl.store(s_input_count1_ptr, 0)
     tl.store(s_need_fallback_ptr, 0)
+    tl.store(s_fallback_eq_count_ptr, 0)
+    tl.store(s_final_cnt_ptr, 0)
+    tl.store(s_threshold_bin_idx_ptr, -1)
+    tl.store(s_final_bin_size_ptr, 0)
+    tl.store(s_found_topk_values_ptr, 0)
 
-    out_init_chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
-    for t in tl.range(0, out_init_chunks):
-        pos = t * BLOCK_SIZE + lane
-        tl.store(out_row + pos * stride_outn, -1, mask=pos < TOPK)
+    init_chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+    for init_idx in tl.range(0, init_chunks):
+        pos = init_idx * BLOCK_SIZE + lane
+        tl.store(s_out_indices_ptr + pos, -1, mask=pos < TOPK)
 
-    hist_clear_chunks: tl.constexpr = (RADIX_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
-    num_scan_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
-
-    # Stage 1: coarse 8-bit histogram on fp16-mapped keys.
-    for t in tl.range(0, hist_clear_chunks):
-        bins = t * BLOCK_SIZE + lane
-        tl.store(hist_base_ptr + bins, 0, mask=bins < RADIX_SIZE)
-
-    for t in tl.range(0, num_scan_tiles):
-        offs = t * BLOCK_SIZE + lane
-        valid = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
-        x = tl.load(row_ptr + offs * stride_xn, mask=valid, other=float("-inf"))
-        digit = _convert_to_uint16_hi8(x)
-        tl.atomic_add(
-            hist_base_ptr + digit,
-            ones,
-            mask=valid,
-            sem="relaxed",
-            scope="cta",
-        )
-
-    radix_bins = tl.arange(0, RADIX_SIZE)
-    zeros_radix = tl.zeros([RADIX_SIZE], dtype=tl.int32)
-    counts = tl.load(hist_base_ptr + radix_bins)
-    gt_exclusive, _ = tle.cumsum(counts, axis=0, reverse=True)
-    cumsum_desc = gt_exclusive + counts
-    threshold_mask = (cumsum_desc > TOPK) & (gt_exclusive <= TOPK)
-    tl.store(s_threshold_bin_ptr + zeros_radix, radix_bins, mask=threshold_mask)
-    tl.store(s_threshold_counts_gt_ptr + zeros_radix, gt_exclusive, mask=threshold_mask)
-    coarse_threshold_bin = tl.load(s_threshold_bin_ptr)
-    coarse_counts_gt = tl.load(s_threshold_counts_gt_ptr)
-    gt_cursors = tl.where(radix_bins > coarse_threshold_bin, gt_exclusive, tl.zeros([RADIX_SIZE], dtype=tl.int32))
-    tl.store(hist_base_ptr + radix_bins, gt_cursors)
-    remaining = TOPK - coarse_counts_gt
-    tl.store(s_write_count_ptr + zeros, coarse_counts_gt, mask=lane == 0)
-
-    # Stage 2: emit coarse winners and compact coarse-threshold candidates.
-    for t in tl.range(0, num_scan_tiles):
-        offs = t * BLOCK_SIZE + lane
-        valid = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
-        idx = offs.to(tl.int32)
-        x = tl.load(row_ptr + offs * stride_xn, mask=valid, other=float("-inf"))
-        digit = _convert_to_uint16_hi8(x)
-
-        take_gt = valid & (digit > coarse_threshold_bin)
-        out_pos_gt = tl.atomic_add(
-            hist_base_ptr + digit,
-            ones,
-            mask=take_gt,
-            sem="relaxed",
-            scope="cta",
-        )
-        tl.store(
-            out_row + out_pos_gt * stride_outn,
-            idx,
-            mask=take_gt & (out_pos_gt < TOPK),
-        )
-
-        take_eq = valid & (digit == coarse_threshold_bin)
-        cand_pos = tl.atomic_add(
-            s_cand0_count_ptr + zeros,
-            ones,
-            mask=take_eq,
-            sem="relaxed",
-            scope="cta",
-        )
-        keep_eq = take_eq & (cand_pos < CAND_BUF_SIZE)
-        tl.store(s_cand0_idx_ptr + cand_pos, idx, mask=keep_eq)
-        overflow_mask = take_eq & (cand_pos >= CAND_BUF_SIZE)
-        tl.atomic_or(
-            s_need_fallback_ptr + zeros,
-            ones,
-            mask=overflow_mask,
-            sem="relaxed",
-            scope="cta",
-        )
-
-    # Stage 3: four 8-bit refinement rounds over compact threshold candidates.
-    for round_idx in tl.static_range(CAND_ROUNDS):
-        need_fallback = tl.load(s_need_fallback_ptr)
-        if (remaining > 0) & (need_fallback == 0):
-            if round_idx & 1:
-                src_idx_ptr = s_cand1_idx_ptr
-                src_count_ptr = s_cand1_count_ptr
-                dst_idx_ptr = s_cand0_idx_ptr
-                dst_count_ptr = s_cand0_count_ptr
+    continue_to_next_step = True
+    need_final_sort = False
+    for step_idx in tl.range(0, 3):
+        if continue_to_next_step:
+            found_topk_values = tl.load(s_found_topk_values_ptr)
+            if step_idx == 0:
+                src_idx_ptr = s_input_idx0_ptr
+                src_val_ptr = s_input_val0_ptr
+                src_count_ptr = s_input_count0_ptr
+                dst_idx_ptr = s_input_idx0_ptr
+                dst_val_ptr = s_input_val0_ptr
+                dst_count_ptr = s_input_count0_ptr
+            elif step_idx == 1:
+                src_idx_ptr = s_input_idx0_ptr
+                src_val_ptr = s_input_val0_ptr
+                src_count_ptr = s_input_count0_ptr
+                dst_idx_ptr = s_input_idx1_ptr
+                dst_val_ptr = s_input_val1_ptr
+                dst_count_ptr = s_input_count1_ptr
             else:
-                src_idx_ptr = s_cand0_idx_ptr
-                src_count_ptr = s_cand0_count_ptr
-                dst_idx_ptr = s_cand1_idx_ptr
-                dst_count_ptr = s_cand1_count_ptr
+                src_idx_ptr = s_input_idx1_ptr
+                src_val_ptr = s_input_val1_ptr
+                src_count_ptr = s_input_count1_ptr
+                dst_idx_ptr = s_input_idx0_ptr
+                dst_val_ptr = s_input_val0_ptr
+                dst_count_ptr = s_input_count0_ptr
 
-            src_count = tl.minimum(tl.load(src_count_ptr), CAND_BUF_SIZE)
-            if src_count > 0:
-                for t in tl.range(0, hist_clear_chunks):
-                    bins = t * BLOCK_SIZE + lane
-                    tl.store(hist_base_ptr + bins, 0, mask=bins < RADIX_SIZE)
-                if round_idx != (CAND_ROUNDS - 1):
-                    tl.store(dst_count_ptr, 0)
-
-                src_tiles = tl.cdiv(src_count, BLOCK_SIZE)
-                shift: tl.constexpr = 24 - round_idx * 8
-                for t in tl.range(0, src_tiles):
-                    pos = t * BLOCK_SIZE + lane
-                    valid = pos < src_count
-                    idx = tl.load(src_idx_ptr + pos, mask=valid, other=0)
-                    x = tl.load(row_ptr + idx.to(tl.int32) * stride_xn, mask=valid, other=float("-inf"))
-                    ordered = _convert_to_uint32(x)
-                    digit = ((ordered >> shift) & 0xFF).to(tl.int32)
-                    tl.atomic_add(
-                        hist_base_ptr + digit,
-                        ones,
-                        mask=valid,
-                        sem="relaxed",
-                        scope="cta",
-                    )
-
-                radix_bins = tl.arange(0, RADIX_SIZE)
-                zeros_radix = tl.zeros([RADIX_SIZE], dtype=tl.int32)
-                counts = tl.load(hist_base_ptr + radix_bins)
-                gt_exclusive, _ = tle.cumsum(counts, axis=0, reverse=True)
-                cumsum_desc = gt_exclusive + counts
-                base_write = tl.load(s_write_count_ptr)
-                threshold_mask = (cumsum_desc > remaining) & (gt_exclusive <= remaining)
-                tl.store(s_threshold_bin_ptr + zeros_radix, radix_bins, mask=threshold_mask)
-                tl.store(s_threshold_counts_gt_ptr + zeros_radix, gt_exclusive, mask=threshold_mask)
-                threshold_bin = tl.load(s_threshold_bin_ptr)
-                counts_gt = tl.load(s_threshold_counts_gt_ptr)
-                gt_cursors = tl.where(
-                    radix_bins > threshold_bin,
-                    base_write + gt_exclusive,
-                    tl.zeros([RADIX_SIZE], dtype=tl.int32),
-                )
-                tl.store(hist_base_ptr + radix_bins, gt_cursors)
-                remaining = remaining - counts_gt
-                tl.store(s_write_count_ptr + zeros, base_write + counts_gt, mask=lane == 0)
-                if round_idx == (CAND_ROUNDS - 1):
-                    tl.store(s_eq_count_ptr, 0)
-
-                for t in tl.range(0, src_tiles):
-                    pos = t * BLOCK_SIZE + lane
-                    valid = pos < src_count
-                    idx = tl.load(src_idx_ptr + pos, mask=valid, other=0)
-                    x = tl.load(row_ptr + idx.to(tl.int32) * stride_xn, mask=valid, other=float("-inf"))
-                    ordered = _convert_to_uint32(x)
-                    digit = ((ordered >> shift) & 0xFF).to(tl.int32)
-
-                    take_gt = valid & (digit > threshold_bin)
-                    out_pos_gt = tl.atomic_add(
-                        hist_base_ptr + digit,
-                        ones,
-                        mask=take_gt,
-                        sem="relaxed",
-                        scope="cta",
-                    )
-                    tl.store(
-                        out_row + out_pos_gt * stride_outn,
-                        idx.to(tl.int32),
-                        mask=take_gt & (out_pos_gt < TOPK),
-                    )
-
-                    if remaining > 0:
-                        take_eq = valid & (digit == threshold_bin)
-                        if round_idx == (CAND_ROUNDS - 1):
-                            out_pos_eq = tl.atomic_add(
-                                s_write_count_ptr + zeros,
-                                ones,
-                                mask=take_eq,
-                                sem="relaxed",
-                                scope="cta",
-                            )
-                            tl.store(
-                                out_row + out_pos_eq * stride_outn,
-                                idx.to(tl.int32),
-                                mask=take_eq & (out_pos_eq < TOPK),
-                            )
-                        else:
-                            dst_pos = tl.atomic_add(
-                                dst_count_ptr + zeros,
-                                ones,
-                                mask=take_eq,
-                                sem="relaxed",
-                                scope="cta",
-                            )
-                            keep_eq = take_eq & (dst_pos < CAND_BUF_SIZE)
-                            tl.store(dst_idx_ptr + dst_pos, idx.to(tl.int32), mask=keep_eq)
-                            overflow_mask = take_eq & (dst_pos >= CAND_BUF_SIZE)
-                            tl.atomic_or(
-                                s_need_fallback_ptr + zeros,
-                                ones,
-                                mask=overflow_mask,
-                                sem="relaxed",
-                                scope="cta",
-                            )
+            continue_to_next_step, step_need_final_sort = _tle_process_histogram_step_smem(
+                row_ptr,
+                stride_xn,
+                row_start,
+                row_end,
+                seq_len,
+                step_idx,
+                found_topk_values,
+                hist_base_ptr,
+                s_out_indices_ptr,
+                s_final_cnt_ptr,
+                s_found_topk_values_ptr,
+                s_threshold_bin_idx_ptr,
+                s_final_bin_size_ptr,
+                src_idx_ptr,
+                src_val_ptr,
+                src_count_ptr,
+                dst_idx_ptr,
+                dst_val_ptr,
+                dst_count_ptr,
+                s_need_fallback_ptr,
+                ASSUME_ALIGNED=ASSUME_ALIGNED,
+                TOPK=TOPK,
+                BLOCK_SIZE=BLOCK_SIZE,
+                SMEM_INPUT_SIZE=SMEM_INPUT_SIZE,
+            )
+            need_final_sort = need_final_sort | step_need_final_sort
 
     if tl.load(s_need_fallback_ptr) != 0:
-        _tle_topk_filtered_fallback_fullscan(
+        _tle_topk_smem_overflow_fallback_fullscan(
             row_ptr,
             out_row,
             stride_xn,
@@ -1389,11 +1832,1127 @@ def tle_topk_selector_kernel_filtered(
             row_end,
             seq_len,
             hist_base_ptr,
-            s_write_count_ptr,
-            s_eq_count_ptr,
+            s_found_topk_values_ptr,
+            s_fallback_eq_count_ptr,
             TOPK=TOPK,
             BLOCK_SIZE=BLOCK_SIZE,
         )
+        return
+
+    if need_final_sort:
+        if USE_RADIX_FINAL:
+            _tle_final_select_radix(
+                hist_base_ptr,
+                s_out_indices_ptr,
+                s_final_cnt_ptr,
+                s_found_topk_values_ptr,
+                TOPK=TOPK,
+                BLOCK_SIZE=BLOCK_SIZE,
+                FINAL_SORT_ITEMS=FINAL_SORT_ITEMS,
+            )
+        else:
+            base_idx = tl.load(s_found_topk_values_ptr)
+            final_cnt = tl.minimum(tl.load(s_final_cnt_ptr), FINAL_SORT_ITEMS)
+            sort_chunks = tl.cdiv(final_cnt, BLOCK_SIZE)
+            for sort_chunk in tl.range(0, sort_chunks):
+                pos = sort_chunk * BLOCK_SIZE + lane
+                valid = pos < final_cnt
+                logit_i_bits = tl.load(
+                    tle.gpu.local_ptr(s_histogram, (FINAL_SORT_ITEMS + pos, )),
+                    mask=valid,
+                    other=0,
+                )
+                logit_i = logit_i_bits.to(tl.float32, bitcast=True)
+                out_rank = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+                for j in tl.range(0, final_cnt):
+                    logit_j_bits = tl.load(tle.gpu.local_ptr(s_histogram, (FINAL_SORT_ITEMS + j, )))
+                    logit_j = logit_j_bits.to(tl.float32, bitcast=True)
+                    better = (logit_i < logit_j) | ((logit_i == logit_j) & (pos < j))
+                    out_rank = out_rank + (valid & better).to(tl.int32)
+                dst_pos = base_idx + out_rank
+                take = valid & (dst_pos < TOPK)
+                idx_i = tl.load(
+                    tle.gpu.local_ptr(s_histogram, (pos, )),
+                    mask=take,
+                    other=0,
+                )
+                tl.store(tle.gpu.local_ptr(s_out_indices, (dst_pos, )), idx_i, mask=take)
+            tl.store(s_found_topk_values_ptr, TOPK)
+
+    flush_chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+    for flush_chunk in tl.static_range(flush_chunks):
+        pos = flush_chunk * BLOCK_SIZE + lane
+        mask = pos < TOPK
+        out_vals = tl.load(s_out_indices_ptr + pos, mask=mask, other=-1)
+        tl.store(out_row + pos * stride_outn, out_vals, mask=mask)
+
+
+@triton.jit
+def _tle_process_histogram_step_smem_cluster(
+    row_ptr,
+    stride_xn,
+    row_start,
+    row_end,
+    seq_len,
+    step_idx,
+    cluster_rank,
+    is_rank0,
+    s_step0_local_hist_ptr,
+    s_histogram_ptr,
+    s_histogram_rank0_ptr,
+    s_out_indices_ptr,
+    s_input_idx0_rank0_ptr,
+    s_input_idx1_rank0_ptr,
+    s_input_val0_rank0_ptr,
+    s_input_val1_rank0_ptr,
+    s_input_count0_rank0_ptr,
+    s_input_count1_rank0_ptr,
+    s_need_fallback_rank0_ptr,
+    s_final_cnt_rank0_ptr,
+    s_found_topk_values_rank0_ptr,
+    s_found_topk_values_ptr,
+    s_threshold_bin_idx_ptr,
+    s_final_bin_size_ptr,
+    s_threshold_bin_idx_rank0_ptr,
+    s_final_bin_size_rank0_ptr,
+    s_final_cnt_ptr,
+    s_input_count0_ptr,
+    s_input_count1_ptr,
+    mesh: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    ASSUME_ALIGNED: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SMEM_INPUT_SIZE: tl.constexpr,
+):
+    FINAL_SORT_ITEMS: tl.constexpr = 2048
+    RADIX11_SIZE: tl.constexpr = 2048
+    RADIX11_MASK: tl.constexpr = 0x7FF
+    RADIX10_SIZE: tl.constexpr = 1024
+    RADIX10_MASK: tl.constexpr = 0x3FF
+    VEC: tl.constexpr = 4
+
+    lane = tl.arange(0, BLOCK_SIZE)
+    vec = tl.arange(0, VEC)
+    ones = tl.full([BLOCK_SIZE], 1, tl.int32)
+    ones_vec_2d = tl.full([BLOCK_SIZE, VEC], 1, tl.int32)
+    zeros = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+    s_histogram_rank0_ptr = tle.remote(s_histogram_rank0_ptr, 0, scope=mesh)
+    s_input_idx0_rank0_ptr = tle.remote(s_input_idx0_rank0_ptr, 0, scope=mesh)
+    s_input_idx1_rank0_ptr = tle.remote(s_input_idx1_rank0_ptr, 0, scope=mesh)
+    s_input_val0_rank0_ptr = tle.remote(s_input_val0_rank0_ptr, 0, scope=mesh)
+    s_input_val1_rank0_ptr = tle.remote(s_input_val1_rank0_ptr, 0, scope=mesh)
+    s_input_count0_rank0_ptr = tle.remote(s_input_count0_rank0_ptr, 0, scope=mesh)
+    s_input_count1_rank0_ptr = tle.remote(s_input_count1_rank0_ptr, 0, scope=mesh)
+    s_need_fallback_rank0_ptr = tle.remote(s_need_fallback_rank0_ptr, 0, scope=mesh)
+    s_final_cnt_rank0_ptr = tle.remote(s_final_cnt_rank0_ptr, 0, scope=mesh)
+    s_threshold_bin_idx_rank0_ptr = tle.remote(s_threshold_bin_idx_rank0_ptr, 0, scope=mesh)
+    s_final_bin_size_rank0_ptr = tle.remote(s_final_bin_size_rank0_ptr, 0, scope=mesh)
+    s_found_topk_values_rank0_ptr = tle.remote(s_found_topk_values_rank0_ptr, 0, scope=mesh)
+
+    clear_rounds = tl.where(step_idx == 2, RADIX10_SIZE // BLOCK_SIZE, RADIX11_SIZE // BLOCK_SIZE)
+
+    for clear_round in tl.range(0, clear_rounds):
+        clear_bins = clear_round * BLOCK_SIZE + lane
+        tl.store(s_step0_local_hist_ptr + clear_bins, 0)
+        if is_rank0:
+            tl.store(s_histogram_ptr + clear_bins, 0)
+    tle.distributed_barrier(mesh)
+
+    if step_idx == 0:
+        if ASSUME_ALIGNED:
+            src_vec_full = seq_len // (BLOCK_SIZE * VEC)
+            vec_processed = src_vec_full * BLOCK_SIZE * VEC
+            src_tail_tiles = tl.cdiv(seq_len - vec_processed, BLOCK_SIZE)
+            for t in tl.range(0, src_vec_full):
+                if (t % CLUSTER_SIZE) == cluster_rank:
+                    base = t * BLOCK_SIZE * VEC + lane * VEC
+                    offs = base[:, None] + vec[None, :]
+                    x_vec = tl.load(row_ptr + offs)
+                    key = _convert_to_trt_uint32(x_vec)
+                    digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+                    hist_digit_ptrs = s_step0_local_hist_ptr + digit
+                    tl.atomic_add(
+                        hist_digit_ptrs,
+                        ones_vec_2d,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+            for t in tl.range(0, src_tail_tiles):
+                if ((src_vec_full + t) % CLUSTER_SIZE) == cluster_rank:
+                    offs = vec_processed + t * BLOCK_SIZE + lane
+                    valid = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+                    x = tl.load(row_ptr + offs, mask=valid, other=float("-inf"))
+                    key = _convert_to_trt_uint32(x)
+                    digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+                    hist_digit_ptrs = s_step0_local_hist_ptr + digit
+                    tl.atomic_add(
+                        hist_digit_ptrs,
+                        ones,
+                        mask=valid,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+        else:
+            n_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
+            for t in tl.range(0, n_tiles):
+                if (t % CLUSTER_SIZE) == cluster_rank:
+                    offs = t * BLOCK_SIZE + lane
+                    valid = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+                    x = tl.load(row_ptr + offs * stride_xn, mask=valid, other=float("-inf"))
+                    key = _convert_to_trt_uint32(x)
+                    digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+                    hist_digit_ptrs = s_step0_local_hist_ptr + digit
+                    tl.atomic_add(
+                        hist_digit_ptrs,
+                        ones,
+                        mask=valid,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+    else:
+        if step_idx == 1:
+            src_count = tl.minimum(tl.load(s_input_count0_rank0_ptr), SMEM_INPUT_SIZE)
+            src_vec_full = src_count // (BLOCK_SIZE * VEC)
+            vec_processed = src_vec_full * BLOCK_SIZE * VEC
+            src_tail_tiles = tl.cdiv(src_count - vec_processed, BLOCK_SIZE)
+            for t in tl.range(0, src_vec_full):
+                if (t % CLUSTER_SIZE) == cluster_rank:
+                    base = t * BLOCK_SIZE * VEC + lane * VEC
+                    pos = base[:, None] + vec[None, :]
+                    val_bits_vec = tl.load(s_input_val0_rank0_ptr + pos)
+                    x_vec = val_bits_vec.to(tl.float32, bitcast=True)
+                    key = _convert_to_trt_uint32(x_vec)
+                    digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+                    hist_digit_ptrs = s_step0_local_hist_ptr + digit
+                    tl.atomic_add(
+                        hist_digit_ptrs,
+                        ones_vec_2d,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+            for t in tl.range(0, src_tail_tiles):
+                if ((src_vec_full + t) % CLUSTER_SIZE) == cluster_rank:
+                    pos = vec_processed + t * BLOCK_SIZE + lane
+                    valid = pos < src_count
+                    val_bits = tl.load(
+                        s_input_val0_rank0_ptr + pos,
+                        mask=valid,
+                        other=0,
+                    )
+                    x = val_bits.to(tl.float32, bitcast=True)
+                    key = _convert_to_trt_uint32(x)
+                    digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+                    hist_digit_ptrs = s_step0_local_hist_ptr + digit
+                    tl.atomic_add(
+                        hist_digit_ptrs,
+                        ones,
+                        mask=valid,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+        else:
+            src_count = tl.minimum(tl.load(s_input_count1_rank0_ptr), SMEM_INPUT_SIZE)
+            src_vec_full = src_count // (BLOCK_SIZE * VEC)
+            vec_processed = src_vec_full * BLOCK_SIZE * VEC
+            src_tail_tiles = tl.cdiv(src_count - vec_processed, BLOCK_SIZE)
+            for t in tl.range(0, src_vec_full):
+                if (t % CLUSTER_SIZE) == cluster_rank:
+                    base = t * BLOCK_SIZE * VEC + lane * VEC
+                    pos = base[:, None] + vec[None, :]
+                    val_bits_vec = tl.load(s_input_val1_rank0_ptr + pos)
+                    x_vec = val_bits_vec.to(tl.float32, bitcast=True)
+                    key = _convert_to_trt_uint32(x_vec)
+                    digit = (key & RADIX10_MASK).to(tl.int32)
+                    hist_digit_ptrs = s_step0_local_hist_ptr + digit
+                    tl.atomic_add(
+                        hist_digit_ptrs,
+                        ones_vec_2d,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+            for t in tl.range(0, src_tail_tiles):
+                if ((src_vec_full + t) % CLUSTER_SIZE) == cluster_rank:
+                    pos = vec_processed + t * BLOCK_SIZE + lane
+                    valid = pos < src_count
+                    val_bits = tl.load(
+                        s_input_val1_rank0_ptr + pos,
+                        mask=valid,
+                        other=0,
+                    )
+                    x = val_bits.to(tl.float32, bitcast=True)
+                    key = _convert_to_trt_uint32(x)
+                    digit = (key & RADIX10_MASK).to(tl.int32)
+                    hist_digit_ptrs = s_step0_local_hist_ptr + digit
+                    tl.atomic_add(
+                        hist_digit_ptrs,
+                        ones,
+                        mask=valid,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+    tle.distributed_barrier(mesh)
+
+    for clear_round in tl.range(0, clear_rounds):
+        bins = clear_round * BLOCK_SIZE + lane
+        local_counts = tl.load(s_step0_local_hist_ptr + bins)
+        rank0_hist_bins_ptr = s_histogram_rank0_ptr + bins
+        tl.atomic_add(
+            rank0_hist_bins_ptr,
+            local_counts,
+            sem="relaxed",
+            scope="cta",
+        )
+    tle.distributed_barrier(mesh)
+
+    if is_rank0:
+        found_topk_values = tl.load(s_found_topk_values_ptr)
+        tl.store(s_threshold_bin_idx_ptr, -1)
+        tl.store(s_final_bin_size_ptr, 0)
+        last_value = found_topk_values
+        threshold_found = False
+        threshold_bin_ptrs = s_threshold_bin_idx_ptr + zeros
+        final_bin_size_ptrs = s_final_bin_size_ptr + zeros
+        for round_idx in tl.range(0, clear_rounds):
+            if not threshold_found:
+                bins = round_idx * BLOCK_SIZE + lane
+                counts = tl.load(s_histogram_ptr + bins)
+                prefix_sum, counts_total = tle.cumsum(counts, axis=0, reverse=False)
+                prefix_sum = prefix_sum + last_value
+                total_sum = last_value + counts_total
+                next_prefix_sum = prefix_sum + counts
+                threshold_mask = (prefix_sum < TOPK) & (next_prefix_sum >= TOPK)
+                threshold_bin = bins
+                threshold_bin_size = next_prefix_sum - prefix_sum
+                tl.store(threshold_bin_ptrs, threshold_bin, mask=threshold_mask)
+                tl.store(final_bin_size_ptrs, threshold_bin_size, mask=threshold_mask)
+                found_round = tl.reduce_or(threshold_mask, axis=0)
+                threshold_found = found_round
+                last_value = total_sum
+    tle.distributed_barrier(mesh)
+
+    threshold_bin_idx = tl.load(s_threshold_bin_idx_rank0_ptr)
+    final_bin_size = tl.load(s_final_bin_size_rank0_ptr)
+    use_final = (step_idx < 2) & (threshold_bin_idx >= 0) & (final_bin_size <= FINAL_SORT_ITEMS)
+    if is_rank0:
+        if use_final:
+            tl.store(s_final_cnt_ptr, 0)
+        elif step_idx < 2:
+            if step_idx == 0:
+                tl.store(s_input_count0_ptr, 0)
+            else:
+                tl.store(s_input_count1_ptr, 0)
+    tle.distributed_barrier(mesh)
+
+    zeros_vec_2d = tl.zeros([BLOCK_SIZE, VEC], dtype=tl.int32)
+    s_input_count0_rank0_ptrs = s_input_count0_rank0_ptr + zeros
+    s_input_count1_rank0_ptrs = s_input_count1_rank0_ptr + zeros
+    s_need_fallback_rank0_ptrs = s_need_fallback_rank0_ptr + zeros
+    s_final_cnt_rank0_ptrs = s_final_cnt_rank0_ptr + zeros
+    s_found_topk_values_rank0_ptrs = s_found_topk_values_rank0_ptr + zeros
+    s_input_count0_rank0_ptrs_vec_2d = s_input_count0_rank0_ptr + zeros_vec_2d
+    s_input_count1_rank0_ptrs_vec_2d = s_input_count1_rank0_ptr + zeros_vec_2d
+    s_need_fallback_rank0_ptrs_vec_2d = s_need_fallback_rank0_ptr + zeros_vec_2d
+    s_final_cnt_rank0_ptrs_vec_2d = s_final_cnt_rank0_ptr + zeros_vec_2d
+    s_found_topk_values_rank0_ptrs_vec_2d = s_found_topk_values_rank0_ptr + zeros_vec_2d
+
+    if step_idx == 0:
+        if ASSUME_ALIGNED:
+            src_vec_full = seq_len // (BLOCK_SIZE * VEC)
+            vec_processed = src_vec_full * BLOCK_SIZE * VEC
+            src_tail_tiles = tl.cdiv(seq_len - vec_processed, BLOCK_SIZE)
+            for t in tl.range(0, src_vec_full):
+                if (t % CLUSTER_SIZE) == cluster_rank:
+                    base = t * BLOCK_SIZE * VEC + lane * VEC
+                    offs = base[:, None] + vec[None, :]
+                    idx = offs.to(tl.int32)
+                    x_vec = tl.load(row_ptr + offs)
+                    key = _convert_to_trt_uint32(x_vec)
+                    digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+
+                    take_lt = digit < threshold_bin_idx
+                    out_pos_lt = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs_vec_2d,
+                        ones_vec_2d,
+                        mask=take_lt,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_lt = take_lt & (out_pos_lt < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_lt,
+                        idx,
+                        mask=keep_lt,
+                    )
+
+                    if use_final:
+                        take_eq_final = digit == threshold_bin_idx
+                        final_pos = tl.atomic_add(
+                            s_final_cnt_rank0_ptrs_vec_2d,
+                            ones_vec_2d,
+                            mask=take_eq_final,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + final_pos,
+                            idx,
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + FINAL_SORT_ITEMS + final_pos,
+                            x_vec.to(tl.int32, bitcast=True),
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                    else:
+                        take_eq_next = digit == threshold_bin_idx
+                        dst_pos = tl.atomic_add(
+                            s_input_count0_rank0_ptrs_vec_2d,
+                            ones_vec_2d,
+                            mask=take_eq_next,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                        tl.store(
+                            s_input_idx0_rank0_ptr + dst_pos,
+                            idx,
+                            mask=keep_eq,
+                        )
+                        tl.store(
+                            s_input_val0_rank0_ptr + dst_pos,
+                            x_vec.to(tl.int32, bitcast=True),
+                            mask=keep_eq,
+                        )
+                        overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                        tl.atomic_or(
+                            s_need_fallback_rank0_ptrs_vec_2d,
+                            ones_vec_2d,
+                            mask=overflow_mask,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+            for t in tl.range(0, src_tail_tiles):
+                if ((src_vec_full + t) % CLUSTER_SIZE) == cluster_rank:
+                    offs = vec_processed + t * BLOCK_SIZE + lane
+                    valid = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+                    idx = offs.to(tl.int32)
+                    x = tl.load(row_ptr + offs, mask=valid, other=float("-inf"))
+                    key = _convert_to_trt_uint32(x)
+                    digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+
+                    take_lt = valid & (digit < threshold_bin_idx)
+                    out_pos_lt = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs,
+                        ones,
+                        mask=take_lt,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_lt = take_lt & (out_pos_lt < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_lt,
+                        idx,
+                        mask=keep_lt,
+                    )
+
+                    if use_final:
+                        take_eq_final = valid & (digit == threshold_bin_idx)
+                        final_pos = tl.atomic_add(
+                            s_final_cnt_rank0_ptrs,
+                            ones,
+                            mask=take_eq_final,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + final_pos,
+                            idx,
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + FINAL_SORT_ITEMS + final_pos,
+                            x.to(tl.int32, bitcast=True),
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                    else:
+                        take_eq_next = valid & (digit == threshold_bin_idx)
+                        dst_pos = tl.atomic_add(
+                            s_input_count0_rank0_ptrs,
+                            ones,
+                            mask=take_eq_next,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                        tl.store(s_input_idx0_rank0_ptr + dst_pos, idx, mask=keep_eq)
+                        tl.store(
+                            s_input_val0_rank0_ptr + dst_pos,
+                            x.to(tl.int32, bitcast=True),
+                            mask=keep_eq,
+                        )
+                        overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                        tl.atomic_or(
+                            s_need_fallback_rank0_ptrs,
+                            ones,
+                            mask=overflow_mask,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+        else:
+            n_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
+            for t in tl.range(0, n_tiles):
+                if (t % CLUSTER_SIZE) == cluster_rank:
+                    offs = t * BLOCK_SIZE + lane
+                    valid = (offs < seq_len) & (offs >= row_start) & (offs < row_end)
+                    idx = offs.to(tl.int32)
+                    x = tl.load(row_ptr + offs * stride_xn, mask=valid, other=float("-inf"))
+                    key = _convert_to_trt_uint32(x)
+                    digit = ((key >> 21) & RADIX11_MASK).to(tl.int32)
+
+                    take_lt = valid & (digit < threshold_bin_idx)
+                    out_pos_lt = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs,
+                        ones,
+                        mask=take_lt,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_lt = take_lt & (out_pos_lt < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_lt,
+                        idx,
+                        mask=keep_lt,
+                    )
+
+                    if use_final:
+                        take_eq_final = valid & (digit == threshold_bin_idx)
+                        final_pos = tl.atomic_add(
+                            s_final_cnt_rank0_ptrs,
+                            ones,
+                            mask=take_eq_final,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + final_pos,
+                            idx,
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + FINAL_SORT_ITEMS + final_pos,
+                            x.to(tl.int32, bitcast=True),
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                    else:
+                        take_eq_next = valid & (digit == threshold_bin_idx)
+                        dst_pos = tl.atomic_add(
+                            s_input_count0_rank0_ptrs,
+                            ones,
+                            mask=take_eq_next,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                        tl.store(s_input_idx0_rank0_ptr + dst_pos, idx, mask=keep_eq)
+                        tl.store(
+                            s_input_val0_rank0_ptr + dst_pos,
+                            x.to(tl.int32, bitcast=True),
+                            mask=keep_eq,
+                        )
+                        overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                        tl.atomic_or(
+                            s_need_fallback_rank0_ptrs,
+                            ones,
+                            mask=overflow_mask,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+    else:
+        if step_idx == 1:
+            src_count = tl.minimum(tl.load(s_input_count0_rank0_ptr), SMEM_INPUT_SIZE)
+            src_vec_full = src_count // (BLOCK_SIZE * VEC)
+            vec_processed = src_vec_full * BLOCK_SIZE * VEC
+            src_tail_tiles = tl.cdiv(src_count - vec_processed, BLOCK_SIZE)
+            for t in tl.range(0, src_vec_full):
+                if (t % CLUSTER_SIZE) == cluster_rank:
+                    base = t * BLOCK_SIZE * VEC + lane * VEC
+                    pos = base[:, None] + vec[None, :]
+                    idx_vec = tl.load(s_input_idx0_rank0_ptr + pos)
+                    val_bits_vec = tl.load(s_input_val0_rank0_ptr + pos)
+                    x_vec = val_bits_vec.to(tl.float32, bitcast=True)
+                    key = _convert_to_trt_uint32(x_vec)
+                    digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+
+                    take_lt = digit < threshold_bin_idx
+                    out_pos_lt = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs_vec_2d,
+                        ones_vec_2d,
+                        mask=take_lt,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_lt = take_lt & (out_pos_lt < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_lt,
+                        idx_vec.to(tl.int32),
+                        mask=keep_lt,
+                    )
+
+                    if use_final:
+                        take_eq_final = digit == threshold_bin_idx
+                        final_pos = tl.atomic_add(
+                            s_final_cnt_rank0_ptrs_vec_2d,
+                            ones_vec_2d,
+                            mask=take_eq_final,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + final_pos,
+                            idx_vec.to(tl.int32),
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + FINAL_SORT_ITEMS + final_pos,
+                            val_bits_vec,
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                    else:
+                        take_eq_next = digit == threshold_bin_idx
+                        dst_pos = tl.atomic_add(
+                            s_input_count1_rank0_ptrs_vec_2d,
+                            ones_vec_2d,
+                            mask=take_eq_next,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                        tl.store(
+                            s_input_idx1_rank0_ptr + dst_pos,
+                            idx_vec.to(tl.int32),
+                            mask=keep_eq,
+                        )
+                        tl.store(
+                            s_input_val1_rank0_ptr + dst_pos,
+                            val_bits_vec,
+                            mask=keep_eq,
+                        )
+                        overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                        tl.atomic_or(
+                            s_need_fallback_rank0_ptrs_vec_2d,
+                            ones_vec_2d,
+                            mask=overflow_mask,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+            for t in tl.range(0, src_tail_tiles):
+                if ((src_vec_full + t) % CLUSTER_SIZE) == cluster_rank:
+                    pos = vec_processed + t * BLOCK_SIZE + lane
+                    valid = pos < src_count
+                    idx = tl.load(s_input_idx0_rank0_ptr + pos, mask=valid, other=0)
+                    val_bits = tl.load(s_input_val0_rank0_ptr + pos, mask=valid, other=0)
+                    x = val_bits.to(tl.float32, bitcast=True)
+                    key = _convert_to_trt_uint32(x)
+                    digit = ((key >> 10) & RADIX11_MASK).to(tl.int32)
+
+                    take_lt = valid & (digit < threshold_bin_idx)
+                    out_pos_lt = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs,
+                        ones,
+                        mask=take_lt,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_lt = take_lt & (out_pos_lt < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_lt,
+                        idx.to(tl.int32),
+                        mask=keep_lt,
+                    )
+
+                    if use_final:
+                        take_eq_final = valid & (digit == threshold_bin_idx)
+                        final_pos = tl.atomic_add(
+                            s_final_cnt_rank0_ptrs,
+                            ones,
+                            mask=take_eq_final,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + final_pos,
+                            idx.to(tl.int32),
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                        tl.store(
+                            s_histogram_rank0_ptr + FINAL_SORT_ITEMS + final_pos,
+                            val_bits,
+                            mask=take_eq_final & (final_pos < FINAL_SORT_ITEMS),
+                        )
+                    else:
+                        take_eq_next = valid & (digit == threshold_bin_idx)
+                        dst_pos = tl.atomic_add(
+                            s_input_count1_rank0_ptrs,
+                            ones,
+                            mask=take_eq_next,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+                        keep_eq = take_eq_next & (dst_pos < SMEM_INPUT_SIZE)
+                        tl.store(
+                            s_input_idx1_rank0_ptr + dst_pos,
+                            idx.to(tl.int32),
+                            mask=keep_eq,
+                        )
+                        tl.store(
+                            s_input_val1_rank0_ptr + dst_pos,
+                            val_bits,
+                            mask=keep_eq,
+                        )
+                        overflow_mask = take_eq_next & (dst_pos >= SMEM_INPUT_SIZE)
+                        tl.atomic_or(
+                            s_need_fallback_rank0_ptrs,
+                            ones,
+                            mask=overflow_mask,
+                            sem="relaxed",
+                            scope="cta",
+                        )
+        else:
+            src_count = tl.minimum(tl.load(s_input_count1_rank0_ptr), SMEM_INPUT_SIZE)
+            src_vec_full = src_count // (BLOCK_SIZE * VEC)
+            vec_processed = src_vec_full * BLOCK_SIZE * VEC
+            src_tail_tiles = tl.cdiv(src_count - vec_processed, BLOCK_SIZE)
+            for t in tl.range(0, src_vec_full):
+                if (t % CLUSTER_SIZE) == cluster_rank:
+                    base = t * BLOCK_SIZE * VEC + lane * VEC
+                    pos = base[:, None] + vec[None, :]
+                    idx_vec = tl.load(s_input_idx1_rank0_ptr + pos)
+                    val_bits_vec = tl.load(s_input_val1_rank0_ptr + pos)
+                    x_vec = val_bits_vec.to(tl.float32, bitcast=True)
+                    key = _convert_to_trt_uint32(x_vec)
+                    digit = (key & RADIX10_MASK).to(tl.int32)
+
+                    take_lt = digit < threshold_bin_idx
+                    out_pos_lt = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs_vec_2d,
+                        ones_vec_2d,
+                        mask=take_lt,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_lt = take_lt & (out_pos_lt < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_lt,
+                        idx_vec.to(tl.int32),
+                        mask=keep_lt,
+                    )
+
+                    take_eq = digit == threshold_bin_idx
+                    out_pos_eq = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs_vec_2d,
+                        ones_vec_2d,
+                        mask=take_eq,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_eq = take_eq & (out_pos_eq < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_eq,
+                        idx_vec.to(tl.int32),
+                        mask=keep_eq,
+                    )
+            for t in tl.range(0, src_tail_tiles):
+                if ((src_vec_full + t) % CLUSTER_SIZE) == cluster_rank:
+                    pos = vec_processed + t * BLOCK_SIZE + lane
+                    valid = pos < src_count
+                    idx = tl.load(s_input_idx1_rank0_ptr + pos, mask=valid, other=0)
+                    val_bits = tl.load(s_input_val1_rank0_ptr + pos, mask=valid, other=0)
+                    x = val_bits.to(tl.float32, bitcast=True)
+                    key = _convert_to_trt_uint32(x)
+                    digit = (key & RADIX10_MASK).to(tl.int32)
+
+                    take_lt = valid & (digit < threshold_bin_idx)
+                    out_pos_lt = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs,
+                        ones,
+                        mask=take_lt,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_lt = take_lt & (out_pos_lt < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_lt,
+                        idx.to(tl.int32),
+                        mask=keep_lt,
+                    )
+
+                    take_eq = valid & (digit == threshold_bin_idx)
+                    out_pos_eq = tl.atomic_add(
+                        s_found_topk_values_rank0_ptrs,
+                        ones,
+                        mask=take_eq,
+                        sem="relaxed",
+                        scope="cta",
+                    )
+                    keep_eq = take_eq & (out_pos_eq < TOPK)
+                    tl.store(
+                        s_out_indices_ptr + out_pos_eq,
+                        idx.to(tl.int32),
+                        mask=keep_eq,
+                    )
+    tle.distributed_barrier(mesh)
+
+    if step_idx < 2:
+        if use_final:
+            continue_to_next_step = False
+            step_need_final_sort = True
+        else:
+            continue_to_next_step = True
+            step_need_final_sort = False
+    else:
+        if is_rank0:
+            tl.store(s_found_topk_values_ptr, TOPK)
+        continue_to_next_step = False
+        step_need_final_sort = False
+    tle.distributed_barrier(mesh)
+    return continue_to_next_step, step_need_final_sort
+
+
+@triton.jit
+def tle_topk_selector_kernel_smem_cluster(
+    x_ptr,
+    out_ptr,
+    starts_ptr,
+    ends_ptr,
+    stride_xm,
+    stride_xn,
+    stride_outm,
+    stride_outn,
+    seq_len,
+    mesh: tl.constexpr,
+    CLUSTER_SIZE: tl.constexpr,
+    ASSUME_ALIGNED: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    SMEM_INPUT_SIZE: tl.constexpr,
+    USE_RADIX_FINAL: tl.constexpr,
+):
+    cluster_pid = tl.program_id(0)
+    cluster_rank = tle.shard_id(mesh, "cluster_x")
+    pid = cluster_pid // CLUSTER_SIZE
+    is_rank0 = cluster_rank == 0
+
+    row_start = tl.load(starts_ptr + pid).to(tl.int32)
+    row_end = tl.load(ends_ptr + pid).to(tl.int32)
+    row_ptr = x_ptr + pid * stride_xm
+    out_row = out_ptr + pid * stride_outm
+    row_len = row_end - row_start
+
+    if ASSUME_ALIGNED:
+        tl.assume(row_start == 0)
+        tl.assume(row_end == seq_len)
+        tl.assume(stride_xn == 1)
+        tl.assume(stride_outn == 1)
+        seq_len = tl.multiple_of(seq_len, BLOCK_SIZE)
+
+    lane = tl.arange(0, BLOCK_SIZE)
+    if row_len <= TOPK:
+        if is_rank0:
+            chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+            for chunk_idx in tl.range(0, chunks):
+                pos = chunk_idx * BLOCK_SIZE + lane
+                take_row = pos < row_len
+                tl.store(out_row + pos * stride_outn, (row_start + pos).to(tl.int32), mask=take_row)
+                take_pad = (pos >= row_len) & (pos < TOPK)
+                tl.store(out_row + pos * stride_outn, -1, mask=take_pad)
+        return
+
+    FINAL_SORT_ITEMS: tl.constexpr = 2048
+    HIST_SIZE: tl.constexpr = 4096
+    RADIX11_SIZE: tl.constexpr = 2048
+    RADIX11_MASK: tl.constexpr = 0x7FF
+    threshold_rounds: tl.constexpr = RADIX11_SIZE // BLOCK_SIZE
+
+    s_histogram = tle.gpu.alloc(
+        [HIST_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_step0_local_hist = tle.gpu.alloc(
+        [RADIX11_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_out_indices = tle.gpu.alloc(
+        [TOPK],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_idx0 = tle.gpu.alloc(
+        [SMEM_INPUT_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_idx1 = tle.gpu.alloc(
+        [SMEM_INPUT_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_val0 = tle.gpu.alloc(
+        [SMEM_INPUT_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_val1 = tle.gpu.alloc(
+        [SMEM_INPUT_SIZE],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_count0 = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_input_count1 = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_need_fallback = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_fallback_eq_count = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_final_cnt = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_threshold_bin_idx = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_final_bin_size = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+    s_found_topk_values = tle.gpu.alloc(
+        [1],
+        dtype=tl.int32,
+        layout=None,
+        scope=tle.gpu.smem,
+        nv_mma_shared_layout=False,
+    )
+
+    s_histogram_ptr = tle.gpu.local_ptr(s_histogram, (0, ))
+    s_input_idx0_ptr = tle.gpu.local_ptr(s_input_idx0, (0, ))
+    s_input_idx1_ptr = tle.gpu.local_ptr(s_input_idx1, (0, ))
+    s_input_val0_ptr = tle.gpu.local_ptr(s_input_val0, (0, ))
+    s_input_val1_ptr = tle.gpu.local_ptr(s_input_val1, (0, ))
+    s_input_count0_ptr = tle.gpu.local_ptr(s_input_count0, (0, ))
+    s_input_count1_ptr = tle.gpu.local_ptr(s_input_count1, (0, ))
+    s_need_fallback_ptr = tle.gpu.local_ptr(s_need_fallback, (0, ))
+    s_fallback_eq_count_ptr = tle.gpu.local_ptr(s_fallback_eq_count, (0, ))
+    s_final_cnt_ptr = tle.gpu.local_ptr(s_final_cnt, (0, ))
+    s_threshold_bin_idx_ptr = tle.gpu.local_ptr(s_threshold_bin_idx, (0, ))
+    s_final_bin_size_ptr = tle.gpu.local_ptr(s_final_bin_size, (0, ))
+    s_found_topk_values_ptr = tle.gpu.local_ptr(s_found_topk_values, (0, ))
+    s_out_indices_ptr = tle.gpu.local_ptr(s_out_indices, (0, ))
+    s_step0_local_hist_ptr = tle.gpu.local_ptr(s_step0_local_hist, (0, ))
+
+    s_histogram_rank0 = tle.remote(s_histogram, 0, scope=mesh)
+    s_input_idx0_rank0 = tle.remote(s_input_idx0, 0, scope=mesh)
+    s_input_idx1_rank0 = tle.remote(s_input_idx1, 0, scope=mesh)
+    s_input_val0_rank0 = tle.remote(s_input_val0, 0, scope=mesh)
+    s_input_val1_rank0 = tle.remote(s_input_val1, 0, scope=mesh)
+    s_input_count0_rank0 = tle.remote(s_input_count0, 0, scope=mesh)
+    s_input_count1_rank0 = tle.remote(s_input_count1, 0, scope=mesh)
+    s_need_fallback_rank0 = tle.remote(s_need_fallback, 0, scope=mesh)
+    s_final_cnt_rank0 = tle.remote(s_final_cnt, 0, scope=mesh)
+    s_threshold_bin_idx_rank0 = tle.remote(s_threshold_bin_idx, 0, scope=mesh)
+    s_final_bin_size_rank0 = tle.remote(s_final_bin_size, 0, scope=mesh)
+    s_found_topk_values_rank0 = tle.remote(s_found_topk_values, 0, scope=mesh)
+    s_out_indices_rank0 = tle.remote(s_out_indices, 0, scope=mesh)
+
+    s_input_count0_rank0_ptr = tle.gpu.local_ptr(s_input_count0_rank0, (0, ))
+    s_input_count1_rank0_ptr = tle.gpu.local_ptr(s_input_count1_rank0, (0, ))
+    s_need_fallback_rank0_ptr = tle.gpu.local_ptr(s_need_fallback_rank0, (0, ))
+    s_final_cnt_rank0_ptr = tle.gpu.local_ptr(s_final_cnt_rank0, (0, ))
+    s_found_topk_values_rank0_ptr = tle.gpu.local_ptr(s_found_topk_values_rank0, (0, ))
+    s_threshold_bin_idx_rank0_ptr = tle.gpu.local_ptr(s_threshold_bin_idx_rank0, (0, ))
+    s_final_bin_size_rank0_ptr = tle.gpu.local_ptr(s_final_bin_size_rank0, (0, ))
+    s_histogram_rank0_ptr = tle.gpu.local_ptr(s_histogram_rank0, (0, ))
+    s_input_idx0_rank0_ptr = tle.gpu.local_ptr(s_input_idx0_rank0, (0, ))
+    s_input_idx1_rank0_ptr = tle.gpu.local_ptr(s_input_idx1_rank0, (0, ))
+    s_input_val0_rank0_ptr = tle.gpu.local_ptr(s_input_val0_rank0, (0, ))
+    s_input_val1_rank0_ptr = tle.gpu.local_ptr(s_input_val1_rank0, (0, ))
+    s_out_indices_rank0_ptr = tle.gpu.local_ptr(s_out_indices_rank0, (0, ))
+
+    if is_rank0:
+        tl.store(s_input_count0_ptr, 0)
+        tl.store(s_input_count1_ptr, 0)
+        tl.store(s_need_fallback_ptr, 0)
+        tl.store(s_fallback_eq_count_ptr, 0)
+        tl.store(s_final_cnt_ptr, 0)
+        tl.store(s_threshold_bin_idx_ptr, -1)
+        tl.store(s_final_bin_size_ptr, 0)
+        tl.store(s_found_topk_values_ptr, 0)
+    init_chunks: tl.constexpr = (TOPK + BLOCK_SIZE - 1) // BLOCK_SIZE
+    for init_idx in tl.range(0, init_chunks):
+        pos = init_idx * BLOCK_SIZE + lane
+        tl.store(s_out_indices_rank0_ptr + pos, -1, mask=is_rank0 & (pos < TOPK))
+    tle.distributed_barrier(mesh)
+
+    continue_to_next_step = True
+    need_final_sort = False
+
+    for step_idx in tl.range(0, 3):
+        if continue_to_next_step:
+            continue_to_next_step, step_need_final_sort = _tle_process_histogram_step_smem_cluster(
+                row_ptr,
+                stride_xn,
+                row_start,
+                row_end,
+                seq_len,
+                step_idx,
+                cluster_rank,
+                is_rank0,
+                s_step0_local_hist_ptr,
+                s_histogram_ptr,
+                s_histogram_rank0_ptr,
+                s_out_indices_rank0_ptr,
+                s_input_idx0_rank0_ptr,
+                s_input_idx1_rank0_ptr,
+                s_input_val0_rank0_ptr,
+                s_input_val1_rank0_ptr,
+                s_input_count0_rank0_ptr,
+                s_input_count1_rank0_ptr,
+                s_need_fallback_rank0_ptr,
+                s_final_cnt_rank0_ptr,
+                s_found_topk_values_rank0_ptr,
+                s_found_topk_values_ptr,
+                s_threshold_bin_idx_ptr,
+                s_final_bin_size_ptr,
+                s_threshold_bin_idx_rank0_ptr,
+                s_final_bin_size_rank0_ptr,
+                s_final_cnt_ptr,
+                s_input_count0_ptr,
+                s_input_count1_ptr,
+                mesh=mesh,
+                CLUSTER_SIZE=CLUSTER_SIZE,
+                ASSUME_ALIGNED=ASSUME_ALIGNED,
+                TOPK=TOPK,
+                BLOCK_SIZE=BLOCK_SIZE,
+                SMEM_INPUT_SIZE=SMEM_INPUT_SIZE,
+            )
+            need_final_sort = need_final_sort | step_need_final_sort
+
+    need_fallback = tl.load(s_need_fallback_rank0_ptr) != 0
+    if need_fallback:
+        if is_rank0:
+            _tle_topk_smem_overflow_fallback_fullscan(
+                row_ptr,
+                out_row,
+                stride_xn,
+                stride_outn,
+                row_start,
+                row_end,
+                seq_len,
+                s_histogram_ptr,
+                s_found_topk_values_ptr,
+                s_fallback_eq_count_ptr,
+                TOPK=TOPK,
+                BLOCK_SIZE=BLOCK_SIZE,
+            )
+        tle.distributed_barrier(mesh)
+        return
+
+    if is_rank0 and need_final_sort:
+        if USE_RADIX_FINAL:
+            _tle_final_select_radix(
+                s_histogram_ptr,
+                s_out_indices_ptr,
+                s_final_cnt_ptr,
+                s_found_topk_values_ptr,
+                TOPK=TOPK,
+                BLOCK_SIZE=BLOCK_SIZE,
+                FINAL_SORT_ITEMS=FINAL_SORT_ITEMS,
+            )
+        else:
+            base_idx = tl.load(s_found_topk_values_ptr)
+            final_cnt = tl.minimum(tl.load(s_final_cnt_ptr), FINAL_SORT_ITEMS)
+            sort_chunks = tl.cdiv(final_cnt, BLOCK_SIZE)
+            for sort_chunk in tl.range(0, sort_chunks):
+                pos = sort_chunk * BLOCK_SIZE + lane
+                valid = pos < final_cnt
+                logit_i_bits = tl.load(
+                    tle.gpu.local_ptr(s_histogram, (FINAL_SORT_ITEMS + pos, )),
+                    mask=valid,
+                    other=0,
+                )
+                logit_i = logit_i_bits.to(tl.float32, bitcast=True)
+                out_rank = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
+                for j in tl.range(0, final_cnt):
+                    logit_j_bits = tl.load(tle.gpu.local_ptr(s_histogram, (FINAL_SORT_ITEMS + j, )))
+                    logit_j = logit_j_bits.to(tl.float32, bitcast=True)
+                    better = (logit_i < logit_j) | ((logit_i == logit_j) & (pos < j))
+                    out_rank = out_rank + (valid & better).to(tl.int32)
+                dst_pos = base_idx + out_rank
+                take = valid & (dst_pos < TOPK)
+                idx_i = tl.load(
+                    tle.gpu.local_ptr(s_histogram, (pos, )),
+                    mask=take,
+                    other=0,
+                )
+                tl.store(s_out_indices_ptr + dst_pos, idx_i, mask=take)
+            tl.store(s_found_topk_values_ptr, TOPK)
+    tle.distributed_barrier(mesh)
+
+    if is_rank0:
+        total_out = tl.minimum(tl.load(s_found_topk_values_ptr), TOPK)
+        flush_chunks = tl.cdiv(total_out, BLOCK_SIZE)
+        for flush_chunk in tl.range(0, flush_chunks):
+            pos = flush_chunk * BLOCK_SIZE + lane
+            mask = pos < total_out
+            out_vals = tl.load(s_out_indices_ptr + pos, mask=mask, other=-1)
+            tl.store(out_row + pos * stride_outn, out_vals, mask=mask)
+    tle.distributed_barrier(mesh)
 
 
 @triton.jit
@@ -1738,6 +3297,13 @@ if _HAVE_TILELANG:
 # ---------------
 
 
+def _supports_tle_cluster_remote() -> bool:
+    if not torch.cuda.is_available():
+        return False
+    major, _minor = torch.cuda.get_device_capability()
+    return major >= 9
+
+
 def tle_topk_selector(
     x,
     starts,
@@ -1783,7 +3349,7 @@ def tle_topk_selector(
     return out
 
 
-def tle_topk_selector_filtered(
+def tle_topk_selector_smem(
     x,
     starts,
     ends,
@@ -1798,14 +3364,15 @@ def tle_topk_selector_filtered(
     batch, seq_len = x.shape
     if out is None:
         out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
-    tle_block_size = TLE_FILTERED_BLOCK_SIZE
+    tle_block_size = TLE_SMEM_BLOCK_SIZE
+    if use_radix_final is None:
+        use_radix_final = seq_len >= TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD
     if assume_aligned is None:
         assume_aligned = (x.is_contiguous() and out.is_contiguous() and (seq_len % tle_block_size == 0)
                           and torch.all(starts == 0).item() and torch.all(ends == seq_len).item())
 
-    batch, seq_len = x.shape
     grid = (batch, )
-    tle_topk_selector_kernel_filtered[grid](
+    tle_topk_selector_kernel_smem[grid](
         x,
         out,
         starts,
@@ -1818,11 +3385,62 @@ def tle_topk_selector_filtered(
         ASSUME_ALIGNED=assume_aligned,
         TOPK=topk,
         BLOCK_SIZE=tle_block_size,
-        CAND_BUF_SIZE=TLE_FILTERED_CAND_BUF_SIZE,
-        num_warps=TLE_FILTERED_NUM_WARPS,
-        num_stages=TLE_FILTERED_NUM_STAGES,
+        SMEM_INPUT_SIZE=TLE_SMEM_INPUT_SIZE,
+        USE_RADIX_FINAL=use_radix_final,
+        num_warps=TLE_SMEM_NUM_WARPS,
+        num_stages=TLE_SMEM_NUM_STAGES,
     )
     return out
+
+
+def tle_topk_selector_smem_cluster(
+    x,
+    starts,
+    ends,
+    topk,
+    block_size=1024,
+    out: Optional[torch.Tensor] = None,
+    assume_aligned: Optional[bool] = None,
+    use_radix_final: Optional[bool] = None,
+):
+    if not _supports_tle_cluster_remote():
+        raise RuntimeError("TLE-SMEM-Cluster requires CUDA SM90+")
+    if x.dtype != torch.float32:
+        x = x.float()
+    batch, seq_len = x.shape
+    if out is None:
+        out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
+    tle_block_size = TLE_SMEM_BLOCK_SIZE
+    if use_radix_final is None:
+        use_radix_final = seq_len >= TLE_RADIX_FINAL_SEQ_LEN_THRESHOLD
+    if assume_aligned is None:
+        assume_aligned = (x.is_contiguous() and out.is_contiguous() and (seq_len % tle_block_size == 0)
+                          and torch.all(starts == 0).item() and torch.all(ends == seq_len).item())
+
+    grid = (batch, )
+    tle_topk_selector_kernel_smem_cluster[grid](
+        x,
+        out,
+        starts,
+        ends,
+        x.stride(0),
+        x.stride(1),
+        out.stride(0),
+        out.stride(1),
+        seq_len,
+        mesh=BLOCK_CLUSTER_MESH_8,
+        CLUSTER_SIZE=TLE_SMEM_CLUSTER_SIZE,
+        ASSUME_ALIGNED=assume_aligned,
+        TOPK=topk,
+        BLOCK_SIZE=tle_block_size,
+        SMEM_INPUT_SIZE=TLE_SMEM_INPUT_SIZE,
+        USE_RADIX_FINAL=use_radix_final,
+        num_ctas=1,
+        num_warps=TLE_SMEM_NUM_WARPS,
+        num_stages=TLE_SMEM_NUM_STAGES,
+    )
+    return out
+
 
 
 def triton_topk_selector(
@@ -2400,7 +4018,8 @@ _BENCH_PROVIDERS = (
     + ["trtllm-prefill"]
     + ["flashinfer-cuda"]
     + ["tle"]
-    + ["tle-filtered"]
+    + ["tle-smem"]
+    + ["tle-smem-cluster"]
     + (["tilelang"] if _HAVE_TILELANG else [])
 )
 _BENCH_NAMES = (
@@ -2411,7 +4030,8 @@ _BENCH_NAMES = (
     + ["TRTLLM-Prefill"]
     + ["FlashInfer"]
     + ["TLE"]
-    + ["TLE-Filtered"]
+    + ["TLE-SMEM"]
+    + ["TLE-SMEM-Cluster"]
     + (["TileLang"] if _HAVE_TILELANG else [])
 )
 _BENCH_STYLES = (
@@ -2422,6 +4042,7 @@ _BENCH_STYLES = (
     + [("brown", "-")]
     + [("gray", "-")]
     + [("orange", "-")]
+    + [("pink", "-")]
     + [("teal", "-")]
     + ([("blue", "-")] if _HAVE_TILELANG else [])
 )
@@ -2436,8 +4057,6 @@ _BENCH_XVALS = [
     (64, 131072, 2048),
     (64, 524288, 2048),
 ]
-_FLASHINFER_SKIP_BATCH = 64
-_FLASHINFER_SKIP_SEQ_LEN_MIN = 131072
 _TILELANG_SKIP_SEQ_LEN_MIN = 262144
 
 
@@ -2451,7 +4070,7 @@ _TILELANG_SKIP_SEQ_LEN_MIN = 262144
         line_names=_BENCH_NAMES,
         styles=_BENCH_STYLES,
         ylabel="ms",
-        plot_name="tle-filtered-topk-selector",
+        plot_name="topk-selector",
         args={},
     )
 )
@@ -2477,17 +4096,35 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
                 assume_aligned=assume_aligned,
             )
 
-    elif provider == "tle-filtered":
-        tle_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
+    elif provider == "tle-smem":
+        tle_smem_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
 
         def run():
-            tle_topk_selector_filtered(
+            tle_topk_selector_smem(
                 x,
                 starts,
                 ends,
                 topk,
                 block_size=block_size,
-                out=tle_out,
+                out=tle_smem_out,
+                assume_aligned=assume_aligned,
+            )
+
+    elif provider == "tle-smem-cluster":
+        if not _supports_tle_cluster_remote():
+            return float("nan"), float("nan"), float("nan")
+        if batch >= 48 and seq_len >= 131072:
+            return float("nan"), float("nan"), float("nan")
+        tle_smem_cluster_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
+
+        def run():
+            tle_topk_selector_smem_cluster(
+                x,
+                starts,
+                ends,
+                topk,
+                block_size=block_size,
+                out=tle_smem_cluster_out,
                 assume_aligned=assume_aligned,
             )
 
@@ -2542,8 +4179,6 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
             )
 
     elif provider == "flashinfer-cuda":
-        if batch == _FLASHINFER_SKIP_BATCH and seq_len >= _FLASHINFER_SKIP_SEQ_LEN_MIN:
-            return float("nan"), float("nan"), float("nan")
         module = _load_embedded_flashinfer_topk()
         if module is None:
             return float("nan"), float("nan"), float("nan")
@@ -2614,7 +4249,7 @@ def run_correctness(batch, seq_len, topk, block_size):
         block_size=block_size,
         assume_aligned=assume_aligned,
     )
-    tle_filtered_out = tle_topk_selector_filtered(
+    tle_smem_out = tle_topk_selector_smem(
         x,
         starts,
         ends,
@@ -2622,9 +4257,23 @@ def run_correctness(batch, seq_len, topk, block_size):
         block_size=block_size,
         assume_aligned=assume_aligned,
     )
+    tle_smem_cluster_out = None
+    if _supports_tle_cluster_remote():
+        tle_smem_cluster_out = tle_topk_selector_smem_cluster(
+            x,
+            starts,
+            ends,
+            topk,
+            block_size=block_size,
+            assume_aligned=assume_aligned,
+        )
 
     print(f"TLE recall vs torch.topk: {_recall(tle_out, ref):.4f}")
-    print(f"TLE-Filtered recall vs torch.topk: {_recall(tle_filtered_out, ref):.4f}")
+    print(f"TLE-SMEM recall vs torch.topk: {_recall(tle_smem_out, ref):.4f}")
+    if tle_smem_cluster_out is not None:
+        print(f"TLE-SMEM-Cluster recall vs torch.topk: {_recall(tle_smem_cluster_out, ref):.4f}")
+    else:
+        print("TLE-SMEM-Cluster not available; skipping cluster correctness.")
     triton_out = triton_topk_selector(
         x,
         starts,
@@ -2635,7 +4284,9 @@ def run_correctness(batch, seq_len, topk, block_size):
     )
     print(f"Triton recall vs torch.topk: {_recall(triton_out, ref):.4f}")
     print(f"TLE recall vs Triton: {_recall(tle_out, triton_out):.4f}")
-    print(f"TLE-Filtered recall vs Triton: {_recall(tle_filtered_out, triton_out):.4f}")
+    print(f"TLE-SMEM recall vs Triton: {_recall(tle_smem_out, triton_out):.4f}")
+    if tle_smem_cluster_out is not None:
+        print(f"TLE-SMEM-Cluster recall vs Triton: {_recall(tle_smem_cluster_out, triton_out):.4f}")
 
     trtllm_fn = _load_embedded_trtllm_indexer_topk()
     if trtllm_fn is not None:
@@ -2759,7 +4410,7 @@ def main(argv=None):
         "--providers",
         type=str,
         default="",
-        help="comma-separated providers for benchmark, e.g. tle,tle-filtered,triton,trtllm-decode,trtllm-prefill",
+        help="comma-separated providers for benchmark, e.g. tle,tle-smem,tle-smem-cluster,triton,trtllm-decode,trtllm-prefill",
     )
     parser.add_argument(
         "--bench_x_vals",

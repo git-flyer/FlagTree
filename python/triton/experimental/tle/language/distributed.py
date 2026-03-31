@@ -755,6 +755,8 @@ def remote(
     Supported input:
     - tle buffered_tensor: returns a remote-marked buffered tensor; caller
       should then use `tle.gpu.local_ptr(...)` to materialize remote pointers.
+    - tl.tensor shared-memory pointer (scalar or tensor): returns remote
+      pointer directly.
 
     `shard_id` is the target block id inside the current thread block cluster.
     When `scope` is provided, launch cluster dimensions are inferred from that
@@ -766,6 +768,11 @@ def remote(
         raise TypeError(f"scope must be device_mesh or None, got {type(scope).__name__}")
     if scope is not None:
         _apply_mesh_cluster_launch(scope, _semantic)
+
+    # Direct pointer path: support local_ptr scalar/tensor values and return
+    # remote pointer with preserved shape.
+    if isinstance(tensor, tl.tensor):
+        return _remote_pointer(tensor, shard_id, scope=scope, _semantic=_semantic)
 
     # Buffered tensor path: carry remote metadata and let `local_ptr` materialize
     # remote pointers later.
@@ -801,9 +808,6 @@ def remote(
         setattr(remote_buffer, "_tle_remote_scope", scope)
         return remote_buffer
 
-    if isinstance(tensor, tl.tensor):
-        raise TypeError("remote(...) only accepts tle.buffered_tensor; "
-                        "use remote(buffered_tensor, shard_id, scope) + local_ptr(...)")
     raise TypeError(f"tensor must be tle.buffered_tensor, got {type(tensor).__name__}")
 
 

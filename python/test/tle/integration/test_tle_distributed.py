@@ -180,13 +180,29 @@ def _remote_const_shard_vectorized_load_kernel(
 
 
 @triton.jit
-def _remote_pointer_input_disallowed_kernel(out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
+def _remote_pointer_input_allowed_kernel(out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
     offs = tl.arange(0, BLOCK)
+    pid = tl.program_id(0)
     smem = tle.gpu.alloc([BLOCK], dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
     local_ptr = tle.gpu.local_ptr(smem, (offs, ))
+    vals = tl.cast(offs + pid * BLOCK, tl.float16)
+    tl.store(local_ptr, vals)
+    tle.distributed_barrier(mesh)
     remote_ptr = tle.remote(local_ptr, 0, scope=mesh)
     vals = tl.load(remote_ptr)
-    tl.store(out_ptr + offs, vals)
+    tl.store(out_ptr + pid * BLOCK + offs, vals)
+
+
+@triton.jit
+def _remote_pointer_scalar_input_allowed_kernel(out_ptr, mesh: tl.constexpr):
+    pid = tl.program_id(0)
+    smem = tle.gpu.alloc([1], dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    local_scalar_ptr = tle.gpu.local_ptr(smem, (0, ))
+    tl.store(local_scalar_ptr, tl.cast(pid, tl.float16))
+    tle.distributed_barrier(mesh)
+    remote_scalar_ptr = tle.remote(local_scalar_ptr, 0, scope=mesh)
+    val = tl.load(remote_scalar_ptr)
+    tl.store(out_ptr + pid, val)
 
 
 @triton.jit
@@ -967,17 +983,61 @@ class TestTLEDistributed:
         expected = torch.cat([expected_chunk, expected_chunk], dim=0)
         torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)
 
-    def test_remote_pointer_input_disallowed(self):
-        out = torch.empty((32, ), device="cuda", dtype=torch.float16)
-        with pytest.raises(Exception, match="only accepts tle.buffered_tensor"):
-            _remote_pointer_input_disallowed_kernel.warmup(
-                out,
-                mesh=BLOCK_CLUSTER_MESH,
-                BLOCK=32,
-                grid=(1, ),
-                num_ctas=1,
-                num_warps=4,
-            )
+    def test_remote_pointer_input_allowed(self):
+        block = 32
+        grid = 1
+        cluster_size = 2
+        out = torch.empty((grid * cluster_size * block, ), device="cuda", dtype=torch.float16)
+
+        compiled = _remote_pointer_input_allowed_kernel.warmup(
+            out,
+            mesh=BLOCK_CLUSTER_MESH,
+            BLOCK=block,
+            grid=(grid, ),
+            num_ctas=1,
+            num_warps=4,
+        )
+        ttgir = compiled.asm["ttgir"]
+        assert "\"tle.remote_pointers\"" in ttgir
+
+        _remote_pointer_input_allowed_kernel[(grid, )](
+            out,
+            mesh=BLOCK_CLUSTER_MESH,
+            BLOCK=block,
+            num_ctas=1,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+
+        expected_chunk = torch.arange(0, block, device="cuda", dtype=torch.float16)
+        expected = torch.cat([expected_chunk, expected_chunk], dim=0)
+        torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)
+
+    def test_remote_pointer_scalar_input_allowed(self):
+        grid = 1
+        cluster_size = 2
+        out = torch.empty((grid * cluster_size, ), device="cuda", dtype=torch.float16)
+
+        compiled = _remote_pointer_scalar_input_allowed_kernel.warmup(
+            out,
+            mesh=BLOCK_CLUSTER_MESH,
+            grid=(grid, ),
+            num_ctas=1,
+            num_warps=4,
+        )
+        ttgir = compiled.asm["ttgir"]
+        assert "\"tle.remote_pointers\"" in ttgir
+
+        _remote_pointer_scalar_input_allowed_kernel[(grid, )](
+            out,
+            mesh=BLOCK_CLUSTER_MESH,
+            num_ctas=1,
+            num_warps=4,
+        )
+        torch.cuda.synchronize()
+
+        expected = torch.zeros_like(out)
+        torch.testing.assert_close(out, expected, atol=0.0, rtol=0.0)
 
     def test_remote_buffer_const_shard_vectorized_load_lowering_same_cluster(self):
         block_m = 32

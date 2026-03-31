@@ -92,8 +92,8 @@ def Tle_DistributedBarrierOp : Tle_Op<"distributed_barrier",
 }
 
 def Tle_RemotePointersOp : Tle_Op<"remote_pointers", [Pure]> {
-  let arguments = (ins TT_Tensor:$src, TT_Int:$shard_id);
-  let results = (outs TT_Tensor:$result);
+  let arguments = (ins Tle_LocalPointerResultType:$src, TT_Int:$shard_id);
+  let results = (outs Tle_LocalPointerResultType:$result);
   let hasVerifier = 1;
 }
 
