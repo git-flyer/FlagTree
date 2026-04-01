@@ -413,7 +413,7 @@ def _unwrap_tile_shape(tile_shape):
         return [val]
 
 
-def _linearize_static_multidim_index(index_list, src_shape, tile_shape_ints):
+def _linearize_static_multidim_index(index_list, src_shape, tile_shape_ints, strides_ints=None):
     """
     Linearize multi-dimensional static index (row-major order).
     index_list:      List[int]  tile coordinate in each dimension
@@ -424,12 +424,13 @@ def _linearize_static_multidim_index(index_list, src_shape, tile_shape_ints):
     rank = len(src_shape)
     if len(index_list) != rank:
         raise ValueError(f"Index rank {len(index_list)} must match source rank {rank}")
-
+    strides_eff = strides_ints if strides_ints else tile_shape_ints
     grid = []
     for i in builtins.range(rank):
-        if src_shape[i] % tile_shape_ints[i] != 0:
-            raise ValueError(f"Source dim {i} ({src_shape[i]}) not divisible by tile dim ({tile_shape_ints[i]})")
-        grid.append(src_shape[i] // tile_shape_ints[i])
+        remainder = (src_shape[i] - tile_shape_ints[i])
+        if remainder < 0 or remainder % strides_eff[i] != 0:
+            raise ValueError(f"(src-tile) not divisible by stride at dim {i}")
+        grid.append(remainder // strides_eff[i] + 1)
 
     for i, v in builtins.enumerate(index_list):
         if v < 0 or v >= grid[i]:
@@ -449,7 +450,7 @@ def _linearize_static_multidim_index(index_list, src_shape, tile_shape_ints):
 # ============================================================
 
 
-def _linearize_dynamic_multidim_index(index_tuple, src_shape, tile_shape_ints, _semantic):
+def _linearize_dynamic_multidim_index(index_tuple, src_shape, tile_shape_ints, _semantic, strides_ints=None):
     """
     Convert dynamic multi-dimensional tile index to linear index IR.
     Example:
@@ -463,11 +464,10 @@ def _linearize_dynamic_multidim_index(index_tuple, src_shape, tile_shape_ints, _
     if any(not isinstance(s, int) for s in src_shape):
         raise ValueError("Source shape must be static for dynamic multi-dim index")
     # compute tile grid
+    strides_eff = strides_ints if strides_ints else tile_shape_ints
     grid = []
-    for s, t in builtins.zip(src_shape, tile_shape_ints):
-        if s % t != 0:
-            raise ValueError(f"Source dim {s} not divisible by tile dim {t}")
-        grid.append(s // t)
+    for i, (s, t) in builtins.enumerate(builtins.zip(src_shape, tile_shape_ints)):
+        grid.append((s - t) // strides_eff[i] + 1)    
     # compute strides
     strides = [1] * len(grid)
     acc = 1
@@ -504,6 +504,7 @@ def extract_tile(
     x: tl.tensor,
     index,
     tile_shape: tuple,
+    strides: tuple = None,
     _semantic=None,
 ) -> tl.tensor:
     """
@@ -533,6 +534,9 @@ def extract_tile(
         ValueError: If index or shape is invalid
         RuntimeError: If IR generation fails
     """
+    strides_ints = None
+    if strides is not None:
+        strides_ints = _unwrap_tile_shape(strides)
     # --- Parameter check ---
     if not isinstance(x, tl.tensor):
         raise ValueError(f"Source must be tl.tensor, but got {type(x)}")
@@ -576,7 +580,7 @@ def extract_tile(
                 # dynamic multidim index
                 # ====================================
                 index_ir_handle = _linearize_dynamic_multidim_index(index_unwrapped, src_shape, tile_shape_ints,
-                                                                    _semantic)
+                                                                    _semantic, strides_ints)
                 is_dynamic = True
             else:
                 # ====================================
@@ -591,7 +595,7 @@ def extract_tile(
 
                 if any(not isinstance(s, int) for s in src_shape):
                     raise ValueError("Source shape must be static when using a multi-dim index")
-                index_value = _linearize_static_multidim_index(idx_ints, src_shape, tile_shape_ints)
+                index_value = _linearize_static_multidim_index(idx_ints, src_shape, tile_shape_ints, strides_ints)
         else:
             # Case C: scalar static index
             scalar_int = _try_unwrap_int(index_unwrapped)
@@ -607,13 +611,17 @@ def extract_tile(
 
     # --- Compile-time check for static index ---
     if not is_dynamic:
-        for i, (s, t) in builtins.enumerate(builtins.zip(src_shape, tile_shape_ints)):
-            if isinstance(s, int) and s % t != 0:
-                raise ValueError(f"Source dim {i} ({s}) not divisible by tile dim ({t})")
+        strides_eff = strides_ints if strides_ints else tile_shape_ints
         if all(isinstance(s, int) for s in src_shape):
+            for i, (s, t, st) in builtins.enumerate(
+                    builtins.zip(src_shape, tile_shape_ints, strides_eff)):
+                if (s - t) < 0 or (s - t) % st != 0:
+                    raise ValueError(
+                        f"(src-tile) not divisible by stride at dim {i}: "
+                        f"src={s}, tile={t}, stride={st}")
             total_tiles = 1
-            for s, t in builtins.zip(src_shape, tile_shape_ints):
-                total_tiles *= s // t
+            for s, t, st in builtins.zip(src_shape, tile_shape_ints, strides_eff):
+                total_tiles *= (s - t) // st + 1 
             if index_value < 0 or index_value >= total_tiles:
                 raise ValueError(f"index {index_value} out of range [0, {total_tiles})")
 
@@ -621,7 +629,7 @@ def extract_tile(
         try:
             from .semantic import TLESemantic
             if isinstance(_semantic, TLESemantic):
-                _semantic.analyze_extract_tile_operation(x, index_value, tile_shape_ints)
+                _semantic.analyze_extract_tile_operation(x, index_value, tile_shape_ints, strides_ints)
         except ImportError:
             pass
 
@@ -634,7 +642,7 @@ def extract_tile(
             # Static index: encode compile-time constant as IR constant
             index_ir = _semantic._convert_to_ir_values([index_value], require_i64=False)[0]
 
-        output = _semantic.builder.create_extract_tile(x.handle, index_ir, tile_shape_ints)
+        output = _semantic.builder.create_extract_tile(x.handle, index_ir, tile_shape_ints, strides_ints or tile_shape_ints)
         block_type = tl.block_type(x.type.element_ty, tile_shape_ints)
         return tl.tensor(output, block_type)
     except Exception as e:

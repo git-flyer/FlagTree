@@ -20,13 +20,15 @@ constexpr int kSharedMemoryAddressSpace = 3;
 // ExtractTileOp Builder
 // ============================================================================
 void ExtractTileOp::build(OpBuilder &builder, OperationState &state, Value src,
-                          Value index, ArrayRef<int64_t> tileShape) {
+                          Value index, ArrayRef<int64_t> tileShape, ArrayRef<int64_t> strides) {
   auto srcType = cast<RankedTensorType>(src.getType());
   auto resultType = RankedTensorType::get(tileShape, srcType.getElementType(),
                                           srcType.getEncoding());
   state.addOperands(src);
   state.addOperands(index);
   state.addAttribute("tile_shape", builder.getDenseI64ArrayAttr(tileShape));
+  SmallVector<int64_t> effectiveStrides(strides.empty() ? tileShape : strides);
+  state.addAttribute("strides", builder.getDenseI64ArrayAttr(effectiveStrides));
   state.addTypes(resultType);
 }
 
@@ -54,6 +56,12 @@ LogicalResult ExtractTileOp::verify() {
     for (auto v : denseArray64.asArrayRef())
       tileShape.push_back(v);
   }
+  SmallVector<int64_t> strides;
+  if (auto a = mlir::dyn_cast_or_null<mlir::DenseI64ArrayAttr>(
+          getOperation()->getAttr("strides")))
+    for (auto v : a.asArrayRef()) strides.push_back(v);
+  if (strides.empty()) strides = tileShape;  
+
 
   // ---- Basic checks required for both static and dynamic index ----
 
@@ -74,11 +82,12 @@ LogicalResult ExtractTileOp::verify() {
   for (size_t i = 0; i < srcShape.size(); ++i) {
     if (tileShape[i] <= 0)
       return emitOpError("tile_shape must be positive at dimension ") << i;
-    if (srcShape[i] % tileShape[i] != 0)
-      return emitOpError(
-                 "source shape must be divisible by tile_shape at dimension ")
-             << i << " (source=" << srcShape[i] << ", tile=" << tileShape[i]
-             << ")";
+    if (strides[i] <= 0)
+      return emitOpError("strides must be positive at dimension ") << i;
+    if ((srcShape[i] - tileShape[i]) < 0 ||
+        (srcShape[i] - tileShape[i]) % strides[i] != 0)
+      return emitOpError("(srcShape - tileShape) must be divisible by strides "
+                         "at dimension ") << i;
     if (dstShape[i] != tileShape[i])
       return emitOpError("result shape must equal tile_shape at dimension ")
              << i;
@@ -103,9 +112,9 @@ LogicalResult ExtractTileOp::verify() {
   SmallVector<int64_t> logicalGridShape(srcShape.size(), 0);
   int64_t totalTiles = 1;
   for (size_t i = 0; i < srcShape.size(); ++i) {
-    logicalGridShape[i] = srcShape[i] / tileShape[i];
+    logicalGridShape[i] = (srcShape[i] - tileShape[i]) / strides[i] + 1;
     totalTiles *= logicalGridShape[i];
-  }
+ }
 
   // Out-of-bounds check
   if (index < 0 || index >= totalTiles)
@@ -123,8 +132,7 @@ LogicalResult ExtractTileOp::verify() {
   // tile indices -> coordinate-level offsets
   SmallVector<int64_t> offsets(srcShape.size(), 0);
   for (size_t i = 0; i < srcShape.size(); ++i)
-    offsets[i] = tileIndices[i] * tileShape[i];
-
+    offsets[i] = tileIndices[i] * strides[i];
   // Boundary check
   if (offsets.size() != static_cast<size_t>(srcTy.getRank()))
     return emitError("offsets size must match tensor rank");
