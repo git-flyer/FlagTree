@@ -904,14 +904,14 @@ def _tle_topk_smem_overflow_fallback_fullscan(
     cumsum_desc = gt_exclusive + counts
     threshold_mask = (cumsum_desc >= TOPK) & (gt_exclusive < TOPK)
     coarse_threshold_bin = tl.sum(
-        tl.where(threshold_mask, radix_bins, tl.zeros([RADIX_SIZE], dtype=tl.int32)),
+        tl.where(threshold_mask, radix_bins, zeros_radix),
         axis=0,
     )
     coarse_counts_gt = tl.sum(
-        tl.where(threshold_mask, gt_exclusive, tl.zeros([RADIX_SIZE], dtype=tl.int32)),
+        tl.where(threshold_mask, gt_exclusive, zeros_radix),
         axis=0,
     )
-    gt_cursors = tl.where(radix_bins > coarse_threshold_bin, gt_exclusive, tl.zeros([RADIX_SIZE], dtype=tl.int32))
+    gt_cursors = tl.where(radix_bins > coarse_threshold_bin, gt_exclusive, zeros_radix)
     tl.store(hist_base_ptr + radix_bins, gt_cursors)
     remaining = TOPK - coarse_counts_gt
     tl.store(s_write_count_ptr + zeros, coarse_counts_gt)
@@ -975,17 +975,17 @@ def _tle_topk_smem_overflow_fallback_fullscan(
             base_write = tl.load(s_write_count_ptr)
             threshold_mask = (cumsum_desc >= remaining) & (gt_exclusive < remaining)
             threshold_bin = tl.sum(
-                tl.where(threshold_mask, radix_bins, tl.zeros([RADIX_SIZE], dtype=tl.int32)),
+                tl.where(threshold_mask, radix_bins, zeros_radix),
                 axis=0,
             )
             counts_gt = tl.sum(
-                tl.where(threshold_mask, gt_exclusive, tl.zeros([RADIX_SIZE], dtype=tl.int32)),
+                tl.where(threshold_mask, gt_exclusive, zeros_radix),
                 axis=0,
             )
             gt_cursors = tl.where(
                 radix_bins > threshold_bin,
                 base_write + gt_exclusive,
-                tl.zeros([RADIX_SIZE], dtype=tl.int32),
+                zeros_radix,
             )
             tl.store(hist_base_ptr + radix_bins, gt_cursors)
             remaining = remaining - counts_gt
