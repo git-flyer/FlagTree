@@ -61,8 +61,7 @@ public:
       SmallVector<triton::gpu::ConvertLayoutOp> outCvts;
       bool allUsersMatch = true;
       for (OpOperand &use : op.getExclusive().getUses()) {
-        auto outCvt =
-            dyn_cast<triton::gpu::ConvertLayoutOp>(use.getOwner());
+        auto outCvt = dyn_cast<triton::gpu::ConvertLayoutOp>(use.getOwner());
         if (!outCvt || outCvt.getSrc() != op.getExclusive()) {
           allUsersMatch = false;
           break;

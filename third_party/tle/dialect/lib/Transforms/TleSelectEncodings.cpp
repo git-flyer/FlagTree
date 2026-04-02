@@ -177,7 +177,8 @@ static bool isRewritableFullViewLocalPointerLoad(triton::LoadOp load) {
   if (!ptrTy)
     return false;
 
-  auto memDescTy = dyn_cast<triton::gpu::MemDescType>(localPointers.getSrc().getType());
+  auto memDescTy =
+      dyn_cast<triton::gpu::MemDescType>(localPointers.getSrc().getType());
   if (!memDescTy)
     return false;
 
@@ -340,7 +341,8 @@ static void copyAxisInfoAttrs(Operation *src, Operation *dst) {
 static void
 collectConsumerEncodingVotes(Value root,
                              llvm::SmallVectorImpl<EncodingVote> &votes) {
-  auto rootLocal = stripConvertLayouts(root).getDefiningOp<triton::tle::LocalPointersOp>();
+  auto rootLocal =
+      stripConvertLayouts(root).getDefiningOp<triton::tle::LocalPointersOp>();
   bool preferMaskForScalarLocalPointers = false;
   if (rootLocal) {
     if (auto memDescTy =
@@ -386,7 +388,8 @@ collectConsumerEncodingVotes(Value root,
         continue;
       }
       if (auto store = dyn_cast<triton::StoreOp>(owner)) {
-        if (Attribute valueEncoding = getStrippedTensorEncoding(store.getValue())) {
+        if (Attribute valueEncoding =
+                getStrippedTensorEncoding(store.getValue())) {
           const int64_t depthFactor = 1 + getScfLoopDepth(owner);
           int64_t score = 2 * depthFactor;
           if (Operation *def = store.getValue().getDefiningOp();
@@ -437,7 +440,8 @@ collectConsumerEncodingVotes(Value root,
         if (Attribute valEncoding = getStrippedTensorEncoding(cas.getVal()))
           votes.push_back({valEncoding, valScore});
         if (resultScore > 0)
-          if (Attribute resultEncoding = getStrippedTensorEncoding(cas.getResult()))
+          if (Attribute resultEncoding =
+                  getStrippedTensorEncoding(cas.getResult()))
             votes.push_back({resultEncoding, resultScore});
         continue;
       }
@@ -847,8 +851,8 @@ class SelectEncodingsPass
                   dyn_cast<RankedTensorType>(remote.getResult().getType());
               if (!remoteResultTy)
                 continue;
-              auto remoteElemPtrTy =
-                  dyn_cast<triton::PointerType>(remoteResultTy.getElementType());
+              auto remoteElemPtrTy = dyn_cast<triton::PointerType>(
+                  remoteResultTy.getElementType());
               if (!remoteElemPtrTy)
                 continue;
               auto desiredElemPtrTy = triton::PointerType::get(
@@ -917,8 +921,8 @@ class SelectEncodingsPass
       for (triton::gpu::ConvertLayoutOp convert : ptrConverts) {
         if (convert->getBlock() == nullptr)
           continue;
-        changed |= tryFoldPointerConvertLayout(
-            convert, builder, userOperandConversionCache);
+        changed |= tryFoldPointerConvertLayout(convert, builder,
+                                               userOperandConversionCache);
       }
     }
   }

@@ -1,7 +1,8 @@
 # flagtree tle
 from .core import (
     cumsum,
-    load, )
+    load,
+)
 from .distributed import (
     B,
     P,

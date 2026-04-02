@@ -249,9 +249,9 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
     unsigned vec = getVectorSize(ptr);
 #ifdef __TLE__
     auto ptrTensorTy = dyn_cast<RankedTensorType>(ptr.getType());
-    auto ptrElemTy =
-        ptrTensorTy ? dyn_cast<PointerType>(ptrTensorTy.getElementType())
-                    : PointerType();
+    auto ptrElemTy = ptrTensorTy
+                         ? dyn_cast<PointerType>(ptrTensorTy.getElementType())
+                         : PointerType();
     bool isSharedTensorPtr =
         ptrElemTy && isSharedFamilyAddressSpace(ptrElemTy.getAddressSpace());
     if (!llMask && isSharedTensorPtr) {
@@ -408,7 +408,8 @@ struct LoadOpConversion : public ConvertOpToLLVMPattern<triton::LoadOp>,
                                                     addrVal);
         addrConstraint = "r";
       }
-      auto *addrOpr = ptxBuilder.newAddrOperand(addrVal, addrConstraint, in_off);
+      auto *addrOpr =
+          ptxBuilder.newAddrOperand(addrVal, addrConstraint, in_off);
 
       // Create L2 cache policy register only for global-memory accesses.
       Value l2PolicyReg;
@@ -645,7 +646,8 @@ struct StoreOpConversion : public ConvertOpToLLVMPattern<triton::StoreOp>,
                                                     addrVal);
         addrConstraint = "r";
       }
-      auto *asmAddr = ptxBuilder.newAddrOperand(addrVal, addrConstraint, in_off);
+      auto *asmAddr =
+          ptxBuilder.newAddrOperand(addrVal, addrConstraint, in_off);
 
       // Create L2 cache policy register only for global-memory accesses.
       Value l2PolicyReg;
@@ -963,7 +965,8 @@ public:
     broadcastIfSplat(valElements);
     if (llMask)
       broadcastIfSplat(maskElements);
-    if (ptrElements.size() != elemsPerThread || valElements.size() != elemsPerThread ||
+    if (ptrElements.size() != elemsPerThread ||
+        valElements.size() != elemsPerThread ||
         (llMask && maskElements.size() != elemsPerThread))
       return op.emitError("unexpected element count in AtomicRMW lowering");
     // packed: e.g. packed=2 for f16x2
@@ -1014,9 +1017,8 @@ public:
             {triton::MemSyncScope::SYSTEM,
              triton::nvgpu::MemSyncScope::SYSTEM}};
 #ifdef __TLE__
-    const bool doPTXLDPromotion =
-        isPromotableToNVPTXLD(op) && vec == 1 && packed == 1 &&
-        ScopeMap.count(op.getScope());
+    const bool doPTXLDPromotion = isPromotableToNVPTXLD(op) && vec == 1 &&
+                                  packed == 1 && ScopeMap.count(op.getScope());
 #else
     const bool doPTXLDPromotion = isPromotableToNVPTXLD(op) && vec == 1 &&
                                   packed == 1 && ScopeMap.count(op.getScope());

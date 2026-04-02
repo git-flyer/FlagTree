@@ -538,9 +538,9 @@ LogicalResult DistributedBarrierOp::verify() {
 LogicalResult RemotePointersOp::verify() {
   Type srcTy = getSrc().getType();
   Type resultTy = getResult().getType();
-  auto getPtrInfo =
-      [&](Type ty, triton::PointerType &ptr, bool &isTensor,
-          ArrayRef<int64_t> &shape, Attribute &encoding) -> LogicalResult {
+  auto getPtrInfo = [&](Type ty, triton::PointerType &ptr, bool &isTensor,
+                        ArrayRef<int64_t> &shape,
+                        Attribute &encoding) -> LogicalResult {
     if (auto tensorTy = dyn_cast<RankedTensorType>(ty)) {
       ptr = dyn_cast<triton::PointerType>(tensorTy.getElementType());
       if (!ptr)
@@ -570,8 +570,7 @@ LogicalResult RemotePointersOp::verify() {
   ArrayRef<int64_t> resultShape;
   Attribute srcEncoding;
   Attribute resultEncoding;
-  if (failed(
-          getPtrInfo(srcTy, srcPtrTy, srcIsTensor, srcShape, srcEncoding)) ||
+  if (failed(getPtrInfo(srcTy, srcPtrTy, srcIsTensor, srcShape, srcEncoding)) ||
       failed(getPtrInfo(resultTy, resultPtrTy, resultIsTensor, resultShape,
                         resultEncoding)))
     return failure();

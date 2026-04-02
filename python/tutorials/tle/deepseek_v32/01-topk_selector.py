@@ -55,7 +55,6 @@ TLE_SMEM_INPUT_SIZE = 4096
 TLE_SMEM_CLUSTER_SIZE = 8
 BLOCK_CLUSTER_MESH_8 = tle.device_mesh({"block_cluster": [("cluster_x", TLE_SMEM_CLUSTER_SIZE)]})
 
-
 # %%
 # Key conversions
 # ---------------
@@ -154,8 +153,7 @@ def processHistogramStep(
         step1_threshold = tl.load(s_step_thresholds_ptr + 1)
         step2_threshold = tl.load(s_step_thresholds_ptr + 2)
         logit_pattern = ((step1_threshold.to(tl.uint32) & RADIX11_MASK) << 21) | (
-            (step2_threshold.to(tl.uint32) & RADIX11_MASK) << 10
-        )
+            (step2_threshold.to(tl.uint32) & RADIX11_MASK) << 10)
 
     n_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
     n_vec_full = seq_len // (BLOCK_SIZE * VEC)
@@ -285,7 +283,6 @@ def processHistogramStep(
     use_final = (step_idx < 3) & (threshold_bin_idx >= 0) & (final_bin_size <= FINAL_SORT_ITEMS)
     if use_final:
         tl.store(s_final_cnt_ptr, 0)
-
 
     found_ptrs = s_found_topk_values_ptr + zeros
     final_cnt_ptrs = s_final_cnt_ptr + zeros
@@ -1969,8 +1966,7 @@ def _tle_process_histogram_step_cluster(
         step1_threshold = tl.load(s_step_thresholds_rank0_ptr + 1)
         step2_threshold = tl.load(s_step_thresholds_rank0_ptr + 2)
         logit_pattern = ((step1_threshold.to(tl.uint32) & RADIX11_MASK) << 21) | (
-            (step2_threshold.to(tl.uint32) & RADIX11_MASK) << 10
-        )
+            (step2_threshold.to(tl.uint32) & RADIX11_MASK) << 10)
 
     n_tiles = tl.cdiv(seq_len, BLOCK_SIZE)
     n_vec_full = seq_len // (BLOCK_SIZE * VEC)
@@ -2729,6 +2725,7 @@ def triton_topk_selector_kernel(
             write_count = out_count
             num_in = next_count
 
+
 # %%
 # TileLang reference (optional)
 # -----------------------------
@@ -2850,8 +2847,8 @@ if _HAVE_TILELANG:
                         if s * BLOCK_SIZE + tx < l_num_input:
                             l_bin_id32 = T.Cast(
                                 T.int32,
-                                ((convert_to_uint32(input[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]])
-                                  >> (24 - round * 8)) & 0xFF),
+                                ((convert_to_uint32(input[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]]) >>
+                                  (24 - round * 8)) & 0xFF),
                             )
                             T.atomic_add(s_histogram[l_bin_id32], 1)
                     T.sync_threads()
@@ -2880,13 +2877,12 @@ if _HAVE_TILELANG:
                         if s * BLOCK_SIZE + tx < l_num_input:
                             l_bin_id32 = T.Cast(
                                 T.int32,
-                                ((convert_to_uint32(input[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]])
-                                  >> (24 - round * 8)) & 0xFF),
+                                ((convert_to_uint32(input[bx, s_input_idx[r_idx, s * BLOCK_SIZE + tx]]) >>
+                                  (24 - round * 8)) & 0xFF),
                             )
                             if l_bin_id32 > l_threshold_bin_id:
-                                pos_gt_round = T.atomic_add(
-                                    s_histogram[l_bin_id32 + 1], 1, return_prev=True
-                                ) + l_start_pos
+                                pos_gt_round = T.atomic_add(s_histogram[l_bin_id32 + 1], 1,
+                                                            return_prev=True) + l_start_pos
                                 index[bx, pos_gt_round] = s_input_idx[r_idx, s * BLOCK_SIZE + tx]
                             elif l_bin_id32 == l_threshold_bin_id and l_new_topk > 0:
                                 if round == 3:
@@ -3104,7 +3100,6 @@ def tle_topk_selector_smem_cluster(
     return out
 
 
-
 def triton_topk_selector(
     x,
     starts,
@@ -3127,13 +3122,8 @@ def triton_topk_selector(
         cand1 = torch.empty((batch, seq_len), dtype=torch.int32, device=x.device)
 
     if assume_aligned is None:
-        assume_aligned = (
-            x.is_contiguous()
-            and out.is_contiguous()
-            and (seq_len % block_size == 0)
-            and torch.all(starts == 0).item()
-            and torch.all(ends == seq_len).item()
-        )
+        assume_aligned = (x.is_contiguous() and out.is_contiguous() and (seq_len % block_size == 0)
+                          and torch.all(starts == 0).item() and torch.all(ends == seq_len).item())
 
     assert cand0.shape == (batch, seq_len) and cand0.dtype == torch.int32 and cand0.is_cuda
     assert cand1.shape == (batch, seq_len) and cand1.dtype == torch.int32 and cand1.is_cuda
@@ -3172,22 +3162,14 @@ def triton_topk_selector(
 # TRT-LLM CUDA reference (optional)
 # ---------------------------------
 
-TRTLLM_INDEXER_TOPK_KERNEL_URL = (
-    "https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/"
-    "cpp/tensorrt_llm/kernels/indexerTopK.cu"
-)
-FLASHINFER_TOPK_CUH_URL = (
-    "https://raw.githubusercontent.com/flashinfer-ai/flashinfer/refs/heads/main/"
-    "include/flashinfer/topk.cuh"
-)
-FLASHINFER_INCLUDE_BASE_URL = (
-    "https://raw.githubusercontent.com/flashinfer-ai/flashinfer/refs/heads/main/"
-    "include/flashinfer/"
-)
-SGLANG_TOPK_KERNEL_URL = (
-    "https://raw.githubusercontent.com/sgl-project/sglang/refs/heads/main/"
-    "sgl-kernel/csrc/elementwise/topk.cu"
-)
+TRTLLM_INDEXER_TOPK_KERNEL_URL = ("https://raw.githubusercontent.com/NVIDIA/TensorRT-LLM/main/"
+                                  "cpp/tensorrt_llm/kernels/indexerTopK.cu")
+FLASHINFER_TOPK_CUH_URL = ("https://raw.githubusercontent.com/flashinfer-ai/flashinfer/refs/heads/main/"
+                           "include/flashinfer/topk.cuh")
+FLASHINFER_INCLUDE_BASE_URL = ("https://raw.githubusercontent.com/flashinfer-ai/flashinfer/refs/heads/main/"
+                               "include/flashinfer/")
+SGLANG_TOPK_KERNEL_URL = ("https://raw.githubusercontent.com/sgl-project/sglang/refs/heads/main/"
+                          "sgl-kernel/csrc/elementwise/topk.cu")
 
 TRTLLM_INDEXER_TOPK_BINDING_CPP = r"""
 #include <torch/extension.h>
@@ -3271,11 +3253,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 def _patch_trtllm_indexer_topk_source(src: str, prefill_threads: int = 512) -> str:
     for old in [
-        '#include "moeTopKFuncs.cuh"\n',
-        '#include "tensorrt_llm/common/config.h"\n',
-        '#include "tensorrt_llm/common/cudaTypeUtils.cuh"\n',
-        '#include "tensorrt_llm/common/envUtils.h"\n',
-        '#include "tensorrt_llm/kernels/noAuxTcKernels.h"\n',
+            '#include "moeTopKFuncs.cuh"\n',
+            '#include "tensorrt_llm/common/config.h"\n',
+            '#include "tensorrt_llm/common/cudaTypeUtils.cuh"\n',
+            '#include "tensorrt_llm/common/envUtils.h"\n',
+            '#include "tensorrt_llm/kernels/noAuxTcKernels.h"\n',
     ]:
         src = src.replace(old, "")
 
@@ -3534,8 +3516,7 @@ def _load_embedded_flashinfer_topk():
         return None
 
     digest = hashlib.sha1(
-        (FLASHINFER_TOPK_BINDING_CPP + FLASHINFER_TOPK_CUDA_SRC + topk_src).encode("utf-8")
-    ).hexdigest()[:12]
+        (FLASHINFER_TOPK_BINDING_CPP + FLASHINFER_TOPK_CUDA_SRC + topk_src).encode("utf-8")).hexdigest()[:12]
     ext_name = f"flagtree_flashinfer_topk_{digest}"
 
     try:
@@ -3588,7 +3569,7 @@ def flashinfer_cuda_topk_selector(
         raise RuntimeError("FlashInfer topk extension unavailable")
     if row_states is None:
         row_state_nbytes = int(module.flashinfer_row_state_nbytes())
-        row_states = torch.zeros((x.shape[0] * row_state_nbytes,), dtype=torch.uint8, device=x.device)
+        row_states = torch.zeros((x.shape[0] * row_state_nbytes, ), dtype=torch.uint8, device=x.device)
     # Current benchmark path uses starts==0 and ends==seq_len; decode/ragged transforms are not used.
     module.flashinfer_topk_cuda(x, out, out_values, row_states, int(topk))
     return out
@@ -3707,36 +3688,12 @@ def _recall(pred, ref):
     return hits / (batch * k)
 
 
-_BENCH_PROVIDERS = (
-    ["triton"]
-    + ["trtllm-prefill"]
-    + ["trtllm-prefill-1024threads"]
-    + ["flashinfer-cuda"]
-    + ["tle-trt"]
-    + ["tle-trt-1024threads"]
-    + ["tle-cluster"]
-    + (["tilelang"] if _HAVE_TILELANG else [])
-)
-_BENCH_NAMES = (
-    ["Triton"]
-    + ["TRTLLM-Prefill"]
-    + ["TRTLLM-Prefill-1024T"]
-    + ["FlashInfer"]
-    + ["TLE-TRT"]
-    + ["TLE-TRT-1024T"]
-    + ["TLE-Cluster"]
-    + (["TileLang"] if _HAVE_TILELANG else [])
-)
-_BENCH_STYLES = (
-    [("red", "-")]
-    + [("black", "-")]
-    + [("brown", "-")]
-    + [("gray", "-")]
-    + [("orange", "-")]
-    + [("olive", "-")]
-    + [("teal", "-")]
-    + ([("blue", "-")] if _HAVE_TILELANG else [])
-)
+_BENCH_PROVIDERS = (["triton"] + ["trtllm-prefill"] + ["trtllm-prefill-1024threads"] + ["flashinfer-cuda"] +
+                    ["tle-trt"] + ["tle-trt-1024threads"] + ["tle-cluster"] + (["tilelang"] if _HAVE_TILELANG else []))
+_BENCH_NAMES = (["Triton"] + ["TRTLLM-Prefill"] + ["TRTLLM-Prefill-1024T"] + ["FlashInfer"] + ["TLE-TRT"] +
+                ["TLE-TRT-1024T"] + ["TLE-Cluster"] + (["TileLang"] if _HAVE_TILELANG else []))
+_BENCH_STYLES = ([("red", "-")] + [("black", "-")] + [("brown", "-")] + [("gray", "-")] + [("orange", "-")] +
+                 [("olive", "-")] + [("teal", "-")] + ([("blue", "-")] if _HAVE_TILELANG else []))
 _BENCH_XVALS = [
     (1, 131072, 2048),
     (1, 262144, 2048),
@@ -3763,8 +3720,7 @@ _TILELANG_SKIP_SEQ_LEN_MIN = 262144
         ylabel="ms",
         plot_name="topk-selector",
         args={},
-    )
-)
+    ))
 def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
     torch.manual_seed(1)
     x = torch.randn(batch, seq_len, device=DEVICE, dtype=torch.float32)
@@ -3889,7 +3845,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
         flashinfer_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
         flashinfer_out_values = torch.empty((batch, topk), dtype=torch.float32, device=x.device)
         row_state_nbytes = int(module.flashinfer_row_state_nbytes())
-        flashinfer_row_states = torch.zeros((batch * row_state_nbytes,), dtype=torch.uint8, device=x.device)
+        flashinfer_row_states = torch.zeros((batch * row_state_nbytes, ), dtype=torch.uint8, device=x.device)
 
         def run():
             flashinfer_cuda_topk_selector(
@@ -4056,7 +4012,8 @@ def _parse_providers(raw):
     return providers
 
 
-def run_bench(block_size, warmup, rep, show_plots, providers=None, bench_x_vals=None, quick_bench=False, max_seq_len=None):
+def run_bench(block_size, warmup, rep, show_plots, providers=None, bench_x_vals=None, quick_bench=False,
+              max_seq_len=None):
     bench = benchmark.benchmarks
 
     x_vals = list(_BENCH_XVALS)
@@ -4116,8 +4073,7 @@ def main(argv=None):
         default="",
         help=(
             "comma-separated providers for benchmark, e.g. "
-            "tle-trt,tle-trt-1024threads,tle-cluster,triton,trtllm-prefill,trtllm-prefill-1024threads,flashinfer-cuda"
-        ),
+            "tle-trt,tle-trt-1024threads,tle-cluster,triton,trtllm-prefill,trtllm-prefill-1024threads,flashinfer-cuda"),
     )
     parser.add_argument(
         "--bench_x_vals",

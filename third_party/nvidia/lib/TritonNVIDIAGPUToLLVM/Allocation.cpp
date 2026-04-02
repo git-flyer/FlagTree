@@ -5,6 +5,7 @@
 #include "Allocation.h"
 #include "TargetInfo.h"
 #include "TritonNVIDIAGPUToLLVM/Passes.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Analysis/Allocation.h"
 #include "triton/Analysis/Utility.h"
 #include "triton/Conversion/TritonGPUToLLVM/AllocateSharedMemoryUtility.h"
@@ -13,7 +14,6 @@
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Tools/GenericSwizzling.h"
 #include "triton/Tools/LayoutUtils.h"
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #ifdef __TLE__
 #include "tle/dialect/include/IR/Dialect.h"
 #endif

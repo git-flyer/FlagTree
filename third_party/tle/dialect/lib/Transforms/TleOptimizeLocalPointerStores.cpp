@@ -85,8 +85,9 @@ class OptimizeLocalPointerStoresPass
         if (!maskTy || maskTy.getShape() != valueTy.getShape())
           continue;
         if (maskTy.getEncoding() != valueTy.getEncoding()) {
-          auto targetMaskTy = RankedTensorType::get(
-              maskTy.getShape(), maskTy.getElementType(), valueTy.getEncoding());
+          auto targetMaskTy =
+              RankedTensorType::get(maskTy.getShape(), maskTy.getElementType(),
+                                    valueTy.getEncoding());
           mask = builder
                      .create<ttg::ConvertLayoutOp>(store.getLoc(), targetMaskTy,
                                                    mask)
@@ -94,10 +95,10 @@ class OptimizeLocalPointerStoresPass
         }
         Value oldValue = builder.create<ttg::LocalLoadOp>(
             store.getLoc(), valueTy, localPointers.getSrc());
-        valueToStore =
-            builder.create<arith::SelectOp>(store.getLoc(), mask, valueToStore,
-                                            oldValue)
-                .getResult();
+        valueToStore = builder
+                           .create<arith::SelectOp>(store.getLoc(), mask,
+                                                    valueToStore, oldValue)
+                           .getResult();
       }
 
       builder.create<ttg::LocalStoreOp>(store.getLoc(), valueToStore,

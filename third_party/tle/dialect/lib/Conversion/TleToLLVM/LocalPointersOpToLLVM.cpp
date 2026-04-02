@@ -161,10 +161,10 @@ struct LocalPointersOpConversion
         }
       }
     } else if (resultTensorTy) {
-      auto fullCoords = emitIndices(loc, rewriter, targetInfo,
-                                    resultTensorTy.getEncoding(),
-                                    resultTensorTy,
-                                    /*withCTAOffset=*/false);
+      auto fullCoords =
+          emitIndices(loc, rewriter, targetInfo, resultTensorTy.getEncoding(),
+                      resultTensorTy,
+                      /*withCTAOffset=*/false);
       if (fullCoords.size() != outVals.size())
         return reportFailure(
             "failed to synthesize full indices for local_pointers");
@@ -247,7 +247,8 @@ struct LocalPointersOpConversion
           }
         }
         if (!foundOffset)
-          return reportFailure("remapped shared layout does not contain offset");
+          return reportFailure(
+              "remapped shared layout does not contain offset");
       }
 
       Value byteOffset = elemOffset;
@@ -326,20 +327,20 @@ struct RemotePointersOpConversion
     for (auto [idx, srcPtr] : llvm::enumerate(srcElems)) {
       if (!isa<LLVM::LLVMPointerType>(srcPtr.getType()))
         return reportFailure("source elements must lower to LLVM pointers");
-      Value shardVal = shardElems.size() == 1 ? shardElems.front()
-                                              : shardElems[idx];
+      Value shardVal =
+          shardElems.size() == 1 ? shardElems.front() : shardElems[idx];
       Value ctaId = ensureI32(shardVal);
       if (!ctaId)
         return reportFailure("shard_id must lower to i32 scalar elements");
       Value mappedPtr = mapSharedToClusterPointer(rewriter, loc, srcPtr, ctaId);
       if (!mappedPtr)
-        return reportFailure(
-            "source pointers must lower to shared/cluster-shared address space");
+        return reportFailure("source pointers must lower to "
+                             "shared/cluster-shared address space");
       mappedPtrs.push_back(mappedPtr);
     }
 
-    Value packed = packLLElements(loc, typeConverter, mappedPtrs, rewriter,
-                                  op.getType());
+    Value packed =
+        packLLElements(loc, typeConverter, mappedPtrs, rewriter, op.getType());
     rewriter.replaceOp(op, packed);
     return success();
   }

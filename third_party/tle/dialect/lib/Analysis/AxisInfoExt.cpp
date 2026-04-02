@@ -48,7 +48,8 @@ public:
     if (!memDescTy)
       return AxisInfo();
 
-    auto resultTensorTy = dyn_cast<RankedTensorType>(local.getResult().getType());
+    auto resultTensorTy =
+        dyn_cast<RankedTensorType>(local.getResult().getType());
     auto resultPtrTy = dyn_cast<PointerType>(local.getResult().getType());
 
     // Scalar pointer result: preserve base shared-memory alignment so later
@@ -58,9 +59,10 @@ public:
       int64_t elemBytes =
           std::max<int64_t>(1, getPointeeBitWidth(resultPtrTy) / 8);
       int64_t baseAlignBytes = elemBytes;
-      if (auto sharedEnc =
-              dyn_cast<triton::gpu::SharedEncodingTrait>(memDescTy.getEncoding()))
-        baseAlignBytes = std::max<int64_t>(baseAlignBytes, sharedEnc.getAlignment());
+      if (auto sharedEnc = dyn_cast<triton::gpu::SharedEncodingTrait>(
+              memDescTy.getEncoding()))
+        baseAlignBytes =
+            std::max<int64_t>(baseAlignBytes, sharedEnc.getAlignment());
 
       int64_t offsetDivElems = highestPowOf2Divisor<int64_t>(0);
       bool hasConstOffset = true;

@@ -409,6 +409,7 @@ def benchmark(M, N, K, provider, dtype):
 
     quantiles = [0.5, 0.2, 0.8]
     if provider == "radix":
+
         def run_kernel():
             triton_radix_topk(x, K, out_vals=y_vals, out_idx=y_idx)
 

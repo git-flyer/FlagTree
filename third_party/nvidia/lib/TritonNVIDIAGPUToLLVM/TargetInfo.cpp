@@ -597,9 +597,9 @@ bool TargetInfo::warpReduce(RewriterBase &rewriter, Location loc,
 }
 
 #ifdef __TLE__
-std::optional<Value>
-TargetInfo::ctaReduceOrPredicate(RewriterBase &rewriter, Location loc,
-                                 Value pred) const {
+std::optional<Value> TargetInfo::ctaReduceOrPredicate(RewriterBase &rewriter,
+                                                      Location loc,
+                                                      Value pred) const {
   auto b = TritonLLVMOpBuilder(loc, rewriter);
   if (!pred.getType().isInteger(1)) {
     Type predTy = pred.getType();

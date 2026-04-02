@@ -160,7 +160,8 @@ def test_tle_cumsum_exclusive_and_total(dtype, n, block, reverse, num_warps):
 
     x_valid = x[:n].to(out_dtype)
     if reverse:
-        expected_exclusive = torch.flip(torch.cumsum(torch.flip(x_valid, dims=[0]), dim=0, dtype=out_dtype), dims=[0]) - x_valid
+        expected_exclusive = torch.flip(torch.cumsum(torch.flip(x_valid, dims=[0]), dim=0, dtype=out_dtype),
+                                        dims=[0]) - x_valid
     else:
         expected_exclusive = torch.cumsum(x_valid, dim=0, dtype=out_dtype) - x_valid
     expected_total = torch.sum(x_valid, dim=0, dtype=out_dtype)

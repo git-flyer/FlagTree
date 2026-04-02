@@ -1,7 +1,7 @@
 #include "tle/dialect/include/Conversion/TleToLLVM/ExclusiveCumsumOpToLLVM.h"
 
-#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
 #include "third_party/nvidia/include/TritonNVIDIAGPUToLLVM/PTXAsmFormat.h"
@@ -18,11 +18,11 @@ namespace {
 using namespace mlir;
 namespace tle = mlir::triton::tle;
 
-static Value createZeroConstant(Location loc, ConversionPatternRewriter &rewriter,
-                                Type ty) {
+static Value createZeroConstant(Location loc,
+                                ConversionPatternRewriter &rewriter, Type ty) {
   if (auto intTy = dyn_cast<IntegerType>(ty)) {
-    return LLVM::ConstantOp::create(
-        rewriter, loc, ty, rewriter.getIntegerAttr(intTy, 0));
+    return LLVM::ConstantOp::create(rewriter, loc, ty,
+                                    rewriter.getIntegerAttr(intTy, 0));
   }
   if (auto floatTy = dyn_cast<FloatType>(ty)) {
     return LLVM::ConstantOp::create(rewriter, loc, ty,
@@ -81,8 +81,7 @@ createIfThenBlocks(ConversionPatternRewriter &rewriter, Location loc,
 }
 
 static Value branchSelect(ConversionPatternRewriter &rewriter, Location loc,
-                          Value condition, Value trueValue,
-                          Value falseValue) {
+                          Value condition, Value trueValue, Value falseValue) {
   Block *prevBlock = rewriter.getInsertionBlock();
   Block *ifBlock = rewriter.splitBlock(prevBlock, rewriter.getInsertionPoint());
   Block *mergeBlock = rewriter.splitBlock(ifBlock, ifBlock->begin());
@@ -162,7 +161,8 @@ struct ExclusiveCumsumOpConversion
     }
 
     auto mod = op->getParentOfType<ModuleOp>();
-    const int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+    const int threadsPerWarp =
+        triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
     const int numWarps = triton::gpu::lookupNumWarps(op);
     const int numThreadsPerCTA = threadsPerWarp * numWarps;
 
@@ -171,8 +171,9 @@ struct ExclusiveCumsumOpConversion
       return rewriter.notifyMatchFailure(op, "failed to materialize zero");
 
     auto inputVals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-    auto inputIndices = emitIndices(loc, rewriter, targetInfo, srcTy.getEncoding(),
-                                    srcTy, /*withCTAOffset=*/false);
+    auto inputIndices =
+        emitIndices(loc, rewriter, targetInfo, srcTy.getEncoding(), srcTy,
+                    /*withCTAOffset=*/false);
     if (inputVals.size() != inputIndices.size())
       return rewriter.notifyMatchFailure(op, "value/index size mismatch");
 
@@ -200,14 +201,16 @@ struct ExclusiveCumsumOpConversion
       Value orderedVal = inputVals.front();
       Value scanVal = orderedVal;
       for (int offset = 1; offset < threadsPerWarp; offset <<= 1) {
-        if (Value scanStep = createWarpScanStepI32(loc, rewriter, scanVal, offset)) {
+        if (Value scanStep =
+                createWarpScanStepI32(loc, rewriter, scanVal, offset)) {
           scanVal = scanStep;
         } else {
           Value shfl = targetInfo.shuffleUp(rewriter, loc, scanVal, offset);
           Value hasPred = b.icmp_sge(laneId, b.i32_val(offset));
           Value combined = createAdd(loc, rewriter, scanVal, shfl, llvmElemTy);
           if (!combined)
-            return rewriter.notifyMatchFailure(op, "unsupported add in warp scan");
+            return rewriter.notifyMatchFailure(op,
+                                               "unsupported add in warp scan");
           scanVal = branchSelect(rewriter, loc, hasPred, combined, scanVal);
         }
       }
@@ -229,8 +232,7 @@ struct ExclusiveCumsumOpConversion
       Value totalSlot = b.add(warpSlotBase, b.i32_val(numWarps));
       Value totalPtrFast = getElemPtr(totalSlot);
       Value isThread0 = b.icmp_eq(threadId, b.i32_val(0));
-      auto [ifBlock, thenBlock] =
-          createIfThenBlocks(rewriter, loc, isThread0);
+      auto [ifBlock, thenBlock] = createIfThenBlocks(rewriter, loc, isThread0);
       rewriter.setInsertionPointToStart(ifBlock);
       Value running = zero;
       for (int w = 0; w < numWarps; ++w) {
@@ -241,8 +243,8 @@ struct ExclusiveCumsumOpConversion
         targetInfo.storeShared(rewriter, loc, slotPtr, running, trueVal);
         Value next = createAdd(loc, rewriter, running, warpSum, llvmElemTy);
         if (!next) {
-          return rewriter.notifyMatchFailure(op,
-                                             "unsupported add in block-prefix scan");
+          return rewriter.notifyMatchFailure(
+              op, "unsupported add in block-prefix scan");
         }
         running = next;
       }
@@ -251,21 +253,21 @@ struct ExclusiveCumsumOpConversion
       targetInfo.barrier(loc, rewriter);
 
       Value blockPrefixPtr = getElemPtr(warpSlot);
-      Value blockPrefix =
-          targetInfo.loadShared(rewriter, loc, blockPrefixPtr, llvmElemTy, trueVal);
+      Value blockPrefix = targetInfo.loadShared(rewriter, loc, blockPrefixPtr,
+                                                llvmElemTy, trueVal);
       Value inclusiveOrdered =
           createAdd(loc, rewriter, scanVal, blockPrefix, llvmElemTy);
       Value exclusiveOrdered =
           createSub(loc, rewriter, inclusiveOrdered, orderedVal, llvmElemTy);
       if (!exclusiveOrdered)
-        return rewriter.notifyMatchFailure(op,
-                                           "unsupported sub in ordered exclusive");
+        return rewriter.notifyMatchFailure(
+            op, "unsupported sub in ordered exclusive");
 
-      Value exclusiveRes = packLLElements(loc, typeConverter,
-                                          SmallVector<Value>{exclusiveOrdered},
-                                          rewriter, srcTy);
-      Value totalRes =
-          targetInfo.loadShared(rewriter, loc, totalPtrFast, llvmElemTy, trueVal);
+      Value exclusiveRes =
+          packLLElements(loc, typeConverter,
+                         SmallVector<Value>{exclusiveOrdered}, rewriter, srcTy);
+      Value totalRes = targetInfo.loadShared(rewriter, loc, totalPtrFast,
+                                             llvmElemTy, trueVal);
       rewriter.replaceOp(op, ValueRange{exclusiveRes, totalRes});
       return success();
     }
@@ -302,20 +304,22 @@ struct ExclusiveCumsumOpConversion
       Value activeOrdered = b.icmp_ult(threadId, axisExtentVal);
 
       Value orderedPtr = getElemPtr(threadId);
-      Value orderedVal =
-          targetInfo.loadShared(rewriter, loc, orderedPtr, llvmElemTy, activeOrdered);
+      Value orderedVal = targetInfo.loadShared(rewriter, loc, orderedPtr,
+                                               llvmElemTy, activeOrdered);
       orderedVal = b.select(activeOrdered, orderedVal, zero);
 
       Value scanVal = orderedVal;
       for (int offset = 1; offset < threadsPerWarp; offset <<= 1) {
-        if (Value scanStep = createWarpScanStepI32(loc, rewriter, scanVal, offset)) {
+        if (Value scanStep =
+                createWarpScanStepI32(loc, rewriter, scanVal, offset)) {
           scanVal = scanStep;
         } else {
           Value shfl = targetInfo.shuffleUp(rewriter, loc, scanVal, offset);
           Value hasPred = b.icmp_sge(laneId, b.i32_val(offset));
           Value combined = createAdd(loc, rewriter, scanVal, shfl, llvmElemTy);
           if (!combined)
-            return rewriter.notifyMatchFailure(op, "unsupported add in warp scan");
+            return rewriter.notifyMatchFailure(op,
+                                               "unsupported add in warp scan");
           scanVal = branchSelect(rewriter, loc, hasPred, combined, scanVal);
         }
       }
@@ -337,8 +341,7 @@ struct ExclusiveCumsumOpConversion
       Value totalSlot = b.add(warpSlotBase, b.i32_val(numWarps));
       Value totalPtrFast = getElemPtr(totalSlot);
       Value isThread0 = b.icmp_eq(threadId, b.i32_val(0));
-      auto [ifBlock, thenBlock] =
-          createIfThenBlocks(rewriter, loc, isThread0);
+      auto [ifBlock, thenBlock] = createIfThenBlocks(rewriter, loc, isThread0);
       rewriter.setInsertionPointToStart(ifBlock);
       Value running = zero;
       for (int w = 0; w < numWarps; ++w) {
@@ -349,8 +352,8 @@ struct ExclusiveCumsumOpConversion
         targetInfo.storeShared(rewriter, loc, slotPtr, running, trueVal);
         Value next = createAdd(loc, rewriter, running, warpSum, llvmElemTy);
         if (!next) {
-          return rewriter.notifyMatchFailure(op,
-                                             "unsupported add in block-prefix scan");
+          return rewriter.notifyMatchFailure(
+              op, "unsupported add in block-prefix scan");
         }
         running = next;
       }
@@ -360,15 +363,15 @@ struct ExclusiveCumsumOpConversion
       targetInfo.barrier(loc, rewriter);
 
       Value blockPrefixPtr = getElemPtr(warpSlot);
-      Value blockPrefix =
-          targetInfo.loadShared(rewriter, loc, blockPrefixPtr, llvmElemTy, trueVal);
+      Value blockPrefix = targetInfo.loadShared(rewriter, loc, blockPrefixPtr,
+                                                llvmElemTy, trueVal);
       Value inclusiveOrdered =
           createAdd(loc, rewriter, scanVal, blockPrefix, llvmElemTy);
       Value exclusiveOrdered =
           createSub(loc, rewriter, inclusiveOrdered, orderedVal, llvmElemTy);
       if (!exclusiveOrdered)
-        return rewriter.notifyMatchFailure(op,
-                                           "unsupported sub in ordered exclusive");
+        return rewriter.notifyMatchFailure(
+            op, "unsupported sub in ordered exclusive");
       targetInfo.storeShared(rewriter, loc, orderedPtr, exclusiveOrdered,
                              activeOrdered);
       // The gather below reads by logical index (reverse remap may read values
@@ -387,16 +390,16 @@ struct ExclusiveCumsumOpConversion
       }
       Value exclusiveRes =
           packLLElements(loc, typeConverter, exclusiveVals, rewriter, srcTy);
-      Value totalRes =
-          targetInfo.loadShared(rewriter, loc, totalPtrFast, llvmElemTy, trueVal);
+      Value totalRes = targetInfo.loadShared(rewriter, loc, totalPtrFast,
+                                             llvmElemTy, trueVal);
       rewriter.replaceOp(op, ValueRange{exclusiveRes, totalRes});
       return success();
     }
 
     // Fallback path: generic serial scan in shared memory by thread-0.
     Value isThread0 = b.icmp_eq(threadId, b.i32_val(0));
-    Type i8PtrTy = LLVM::LLVMPointerType::get(rewriter.getContext(),
-                                              targetInfo.getSharedAddressSpace());
+    Type i8PtrTy = LLVM::LLVMPointerType::get(
+        rewriter.getContext(), targetInfo.getSharedAddressSpace());
     unsigned elemBytes = static_cast<unsigned>(
         std::max<int>(1, srcTy.getElementTypeBitWidth() / 8));
     int64_t totalByteOffset =
@@ -414,11 +417,13 @@ struct ExclusiveCumsumOpConversion
     for (int64_t i = 0; i < axisExtent; ++i) {
       Value idx = b.i32_val(static_cast<int32_t>(i));
       Value ptr = getElemPtr(idx);
-      Value inVal = targetInfo.loadShared(rewriter, loc, ptr, llvmElemTy, isThread0);
+      Value inVal =
+          targetInfo.loadShared(rewriter, loc, ptr, llvmElemTy, isThread0);
       targetInfo.storeShared(rewriter, loc, ptr, running, isThread0);
       Value next = createAdd(loc, rewriter, running, inVal, llvmElemTy);
       if (!next)
-        return rewriter.notifyMatchFailure(op, "unsupported add for element type");
+        return rewriter.notifyMatchFailure(op,
+                                           "unsupported add for element type");
       running = next;
     }
     targetInfo.storeShared(rewriter, loc, totalPtr, running, isThread0);

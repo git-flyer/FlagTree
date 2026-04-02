@@ -119,7 +119,8 @@ def _remote_peer_smem_2d_kernel(
     cols = tl.broadcast_to(tl.arange(0, BLOCK_K)[None, :], (BLOCK_M, BLOCK_K))
     vals = tl.cast(rows * BLOCK_K + cols + pid * BLOCK_M * BLOCK_K, tl.float32)
 
-    smem = tle.gpu.alloc([BLOCK_M, BLOCK_K], dtype=tl.float32, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    smem = tle.gpu.alloc([BLOCK_M, BLOCK_K], dtype=tl.float32, layout=None, scope=tle.gpu.smem,
+                         nv_mma_shared_layout=False)
     local_ptr = tle.gpu.local_ptr(smem, (rows, cols))
     tl.store(local_ptr, vals)
     tle.distributed_barrier(mesh)
@@ -165,7 +166,8 @@ def _remote_const_shard_vectorized_load_kernel(
     cols = tl.broadcast_to(tl.arange(0, BLOCK_K)[None, :], (BLOCK_M, BLOCK_K))
     vals = tl.cast(rows * BLOCK_K + cols + pid * BLOCK_M * BLOCK_K, tl.float16)
 
-    smem = tle.gpu.alloc([BLOCK_M, BLOCK_K], dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    smem = tle.gpu.alloc([BLOCK_M, BLOCK_K], dtype=tl.float16, layout=None, scope=tle.gpu.smem,
+                         nv_mma_shared_layout=False)
     local_ptr = tle.gpu.local_ptr(smem, (rows, cols))
     tl.store(local_ptr, vals)
     tle.distributed_barrier(mesh)
@@ -217,7 +219,8 @@ def _remote_buffer_const_shard_vectorized_load_kernel(
     cols = tl.broadcast_to(tl.arange(0, BLOCK_K)[None, :], (BLOCK_M, BLOCK_K))
     vals = tl.cast(rows * BLOCK_K + cols + pid * BLOCK_M * BLOCK_K, tl.float16)
 
-    smem = tle.gpu.alloc([BLOCK_M, BLOCK_K], dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    smem = tle.gpu.alloc([BLOCK_M, BLOCK_K], dtype=tl.float16, layout=None, scope=tle.gpu.smem,
+                         nv_mma_shared_layout=False)
     local_ptr = tle.gpu.local_ptr(smem, (rows, cols))
     tl.store(local_ptr, vals)
     tle.distributed_barrier(mesh)
@@ -245,7 +248,8 @@ def _remote_buffer_const_shard_vectorized_load_rank3_kernel(
     vals = tl.cast(rows * BLOCK_K + cols + pid * BLOCK_M * BLOCK_K, tl.float16)
     slots = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.int32) + SLOT
 
-    smem = tle.gpu.alloc([2, BLOCK_M, BLOCK_K], dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    smem = tle.gpu.alloc([2, BLOCK_M, BLOCK_K], dtype=tl.float16, layout=None, scope=tle.gpu.smem,
+                         nv_mma_shared_layout=False)
     local_ptr = tle.gpu.local_ptr(smem, (slots, rows, cols))
     tl.store(local_ptr, vals)
     tle.distributed_barrier(mesh)
@@ -310,9 +314,7 @@ def _remote_rank0_dsmem_scalar_ptr_atomic_add_kernel(out_ptr, mesh: tl.constexpr
 
 
 @triton.jit
-def _remote_rank0_dsmem_buffer_vs_ptr_remote_atomic_add_kernel(
-    out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr
-):
+def _remote_rank0_dsmem_buffer_vs_ptr_remote_atomic_add_kernel(out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
     rank = tle.shard_id(mesh, "cluster_x")
     zeros = tl.zeros((BLOCK, ), dtype=tl.int32)
     ones = tl.full((BLOCK, ), 1, tl.int32)
@@ -559,7 +561,8 @@ def _remote_dot_dotk32_kernel(
     a_rows_full = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, BK))
     a_cols_full = tl.broadcast_to(tl.arange(0, BK)[None, :], (BM, BK))
     a_rows = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, DOT_K))
-    a_buf = tle.gpu.alloc([A_SLOTS, BM, BK], dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    a_buf = tle.gpu.alloc([A_SLOTS, BM, BK], dtype=tl.float16, layout=None, scope=tle.gpu.smem,
+                          nv_mma_shared_layout=False)
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     shard_id = tl.load(shard_id_ptr + pid)
@@ -636,7 +639,8 @@ def _remote_dot_masked_kernel(
     a_rows_full = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, BK))
     a_cols_full = tl.broadcast_to(tl.arange(0, BK)[None, :], (BM, BK))
     a_rows = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, DOT_K))
-    a_buf = tle.gpu.alloc([A_SLOTS, BM, BK], dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    a_buf = tle.gpu.alloc([A_SLOTS, BM, BK], dtype=tl.float16, layout=None, scope=tle.gpu.smem,
+                          nv_mma_shared_layout=False)
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     shard_id = tl.load(shard_id_ptr + pid)
@@ -733,7 +737,8 @@ def _remote_dot_prefetch_kernel(
     a_rows_full = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, BK))
     a_cols_full = tl.broadcast_to(tl.arange(0, BK)[None, :], (BM, BK))
     a_rows = tl.broadcast_to(tl.arange(0, BM)[:, None], (BM, DOT_K))
-    a_buf = tle.gpu.alloc([A_SLOTS, BM, BK], dtype=tl.float16, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    a_buf = tle.gpu.alloc([A_SLOTS, BM, BK], dtype=tl.float16, layout=None, scope=tle.gpu.smem,
+                          nv_mma_shared_layout=False)
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     shard_id = tl.load(shard_id_ptr + pid)
@@ -971,8 +976,7 @@ class TestTLEDistributed:
         ptx = compiled.asm["ptx"]
 
         # local/remote pointer tensors should keep the load-friendly encoding.
-        assert re.search(r"tensor<256x!tt\.ptr<f16,\s*3>,\s*#blocked[0-9]*>",
-                         ttgir) is not None
+        assert re.search(r"tensor<256x!tt\.ptr<f16,\s*3>,\s*#blocked[0-9]*>", ttgir) is not None
         assert re.search(
             r"\"tle\.remote_pointers\"\(%[^,]+,\s*%[^)]+\)\s*:\s*"
             r"\(tensor<256x!tt\.ptr<f16,\s*3>,\s*#blocked[0-9]*>,\s*i32\)\s*->\s*"

@@ -34,8 +34,8 @@ public:
     Location loc = op->getLoc();
 
 #ifdef __TLE__
-    if (succeeded(tryLowerCtaOrReductionFastpath(op, adaptor, helper,
-                                                 rewriter))) {
+    if (succeeded(
+            tryLowerCtaOrReductionFastpath(op, adaptor, helper, rewriter))) {
       return success();
     }
 #endif
@@ -98,9 +98,10 @@ private:
     return combine && isa<arith::OrIOp>(combine);
   }
 
-  LogicalResult tryLowerCtaOrReductionFastpath(
-      triton::ReduceOp op, OpAdaptor adaptor, ReduceOpHelper &helper,
-      ConversionPatternRewriter &rewriter) const {
+  LogicalResult
+  tryLowerCtaOrReductionFastpath(triton::ReduceOp op, OpAdaptor adaptor,
+                                 ReduceOpHelper &helper,
+                                 ConversionPatternRewriter &rewriter) const {
     if (helper.isWarpSynchronous() || !isOrReductionToScalarI1(op))
       return failure();
 

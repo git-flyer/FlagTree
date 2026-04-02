@@ -1,6 +1,7 @@
 # flagtree tle
 import triton.language.core as tl
 
+
 def _tle_pick_sum_dtype(in_dtype, dtype):
     if dtype is not None:
         return dtype
@@ -9,6 +10,7 @@ def _tle_pick_sum_dtype(in_dtype, dtype):
     if in_dtype.is_int_unsigned():
         return tl.uint32 if in_dtype.int_bitwidth < 32 else None
     return None
+
 
 # -----------------------
 # Non-Atomic Memory Operations

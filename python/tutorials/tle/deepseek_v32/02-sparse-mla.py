@@ -478,17 +478,16 @@ if _HAVE_TILELANG:
         H_per_block = padded_H if replicate_h == 1 else 64
 
         @T.prim_func
-        def main(
-            Q: T.Tensor(q_shape, dtype),  # type: ignore
-            KV: T.Tensor(kv_shape, dtype),  # type: ignore
-            Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
-            Output: T.Tensor(o_shape, dtype),  # type: ignore
-            Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
-        ):
+        def main(Q: T.Tensor(q_shape, dtype),  # type: ignore
+                 KV: T.Tensor(kv_shape, dtype),  # type: ignore
+                 Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+                 Output: T.Tensor(o_shape, dtype),  # type: ignore
+                 Lse: T.Tensor(lse_shape, accum_dtype),  # type: ignore
+                 ):
             with T.Kernel(seq_len * replicate_h, batch, kv_group, threads=threads) as (
-                bx,
-                by,
-                bz,
+                    bx,
+                    by,
+                    bz,
             ):
                 Q_shared = T.alloc_shared([H_per_block, D], dtype)
                 Q_tail_shared = T.alloc_shared([H_per_block, D_tail], dtype)
@@ -587,7 +586,8 @@ def tilelang_sparse_mla_fwd_interface(
     assert kv.shape[-1] == dim_plus_tail_dim
     tail_dim = dim_plus_tail_dim - dim
     assert dim == triton.next_power_of_2(dim), f"d_v should be power-of-2 for TileLang path, but got {dim}"
-    assert tail_dim == triton.next_power_of_2(tail_dim), f"tail dim should be power-of-2 for TileLang path, but got {tail_dim}"
+    assert tail_dim == triton.next_power_of_2(
+        tail_dim), f"tail dim should be power-of-2 for TileLang path, but got {tail_dim}"
     _, _, _, topk = indices.shape
     assert indices.shape == (batch, seq_len, kv_group, topk)
 
@@ -617,7 +617,7 @@ def _build_sparse_mla_inputs(B=1, S=4096, SKV=4096, H=128, HKV=1, DQK=576, topk=
         for t in range(S):
             for h in range(HKV):
                 i_i = torch.randperm(max(1, t))[:topk]
-                indices[b, t, h, : len(i_i)] = i_i
+                indices[b, t, h, :len(i_i)] = i_i
     return q, kv, indices
 
 
@@ -646,14 +646,15 @@ def ref_sparse_mla_fwd_interface(q, kv, indices, sm_scale=None, is_casual=True, 
     b, _, _, dim_v = v.shape
     g_index = g
     h_index = h // g
-    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32, device="cuda").view(-1, 1) >= torch.arange(
-        1 - 1, sk * 1, 1, dtype=torch.int32, device="cuda"
-    ).view(1, -1)
+    compressed_casual_mask = torch.arange(0, sq, dtype=torch.int32,
+                                          device="cuda").view(-1,
+                                                              1) >= torch.arange(1 - 1, sk * 1, 1, dtype=torch.int32,
+                                                                                 device="cuda").view(1, -1)
 
     mask = q.new_zeros(b, g_index, sq, sk + 1, dtype=torch.bool).scatter(3, indices.long(), 1)
     mask = mask[..., :-1]
     mask = mask & compressed_casual_mask.view(1, 1, sq, sk)
-    mask[:, :, : 1 - 1, 0] = True
+    mask[:, :, :1 - 1, 0] = True
     mask = mask.view(b, g_index, 1, sq, sk)
 
     q = q.view(b, sq, g, -1, dim_q)
@@ -677,21 +678,9 @@ def _bench_ms(fn, warmup=200, rep=100):
     return float(ms if not isinstance(ms, tuple) else ms[0])
 
 
-_BENCH_PROVIDERS = (
-    ["triton"]
-    + ["tle"]
-    + (["tilelang"] if _HAVE_TILELANG else [])
-)
-_BENCH_NAMES = (
-    ["Triton"]
-    + ["TLE"]
-    + (["TileLang"] if _HAVE_TILELANG else [])
-)
-_BENCH_STYLES = (
-    [("red", "-")]
-    + [("orange", "-")]
-    + ([("blue", "-")] if _HAVE_TILELANG else [])
-)
+_BENCH_PROVIDERS = (["triton"] + ["tle"] + (["tilelang"] if _HAVE_TILELANG else []))
+_BENCH_NAMES = (["Triton"] + ["TLE"] + (["TileLang"] if _HAVE_TILELANG else []))
+_BENCH_STYLES = ([("red", "-")] + [("orange", "-")] + ([("blue", "-")] if _HAVE_TILELANG else []))
 _BENCH_X_VALS = [
     # (B, S, SKV, H, HKV, DQK, DV, topk)
     (1, 512, 1024, 128, 1, 192, 128, 512),
@@ -713,8 +702,7 @@ _BENCH_X_VALS = [
         ylabel="ms",
         plot_name="tle-sparse-mla-fwd",
         args={},
-    )
-)
+    ))
 def benchmark_sparse_mla_fwd(
     B,
     S,
@@ -769,15 +757,14 @@ def benchmark_sparse_mla_fwd(
             rep=rep,
         )
     except Exception as exc:  # pragma: no cover - depends on runtime/resource limits
-        print(
-            f"[bench:{provider}] failed for "
-            f"(B={B}, S={S}, SKV={SKV}, H={H}, HKV={HKV}, DQK={DQK}, DV={DV}, topk={topk}): {exc}"
-        )
+        print(f"[bench:{provider}] failed for "
+              f"(B={B}, S={S}, SKV={SKV}, H={H}, HKV={HKV}, DQK={DQK}, DV={DV}, topk={topk}): {exc}")
         return float("nan"), float("nan"), float("nan")
     return ms, max_ms, min_ms
 
 
-def run_bench_table(warmup=100, rep=50, show_plots=False, tilelang_block_I=64, tilelang_num_stages=2, tilelang_threads=256):
+def run_bench_table(warmup=100, rep=50, show_plots=False, tilelang_block_I=64, tilelang_num_stages=2,
+                    tilelang_threads=256):
     benchmark_sparse_mla_fwd.run(
         print_data=True,
         show_plots=show_plots,
@@ -899,10 +886,8 @@ def bench_sparse_mla_fwd(
     if _HAVE_TILELANG:
         resolved_block_i = _resolve_tilelang_block_i(topk, tilelang_block_I)
         if resolved_block_i != tilelang_block_I:
-            print(
-                f"TileLang block_I auto-adjusted from {tilelang_block_I} to {resolved_block_i} "
-                f"for topk={topk}."
-            )
+            print(f"TileLang block_I auto-adjusted from {tilelang_block_I} to {resolved_block_i} "
+                  f"for topk={topk}.")
 
         def run_tilelang():
             return tilelang_sparse_mla_fwd_interface(

@@ -71,8 +71,7 @@ public:
   // Optional fastpath for CTA-wide boolean OR reduction.
   // Returns std::nullopt when unsupported so callers can fall back.
   virtual std::optional<Value>
-  ctaReduceOrPredicate(RewriterBase &rewriter, Location loc,
-                       Value pred) const {
+  ctaReduceOrPredicate(RewriterBase &rewriter, Location loc, Value pred) const {
     return std::nullopt;
   }
 #endif

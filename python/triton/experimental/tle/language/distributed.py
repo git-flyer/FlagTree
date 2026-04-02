@@ -685,9 +685,7 @@ def _create_remote_pointers_tensor(
     if not tensor.dtype.is_ptr():
         raise TypeError("remote(pointer, ...) requires a pointer tensor input")
     if not hasattr(builder, "create_remote_pointers"):
-        raise RuntimeError(
-            "remote pointer lowering requires TLE remote_pointers support in the active Triton build"
-        )
+        raise RuntimeError("remote pointer lowering requires TLE remote_pointers support in the active Triton build")
     remote_ptr_dtype = tl.pointer_type(tensor.dtype.element_ty, 7)
     if tensor.type.is_block():
         remote_type = tl.block_type(remote_ptr_dtype, list(tensor.shape)).to_ir(builder)

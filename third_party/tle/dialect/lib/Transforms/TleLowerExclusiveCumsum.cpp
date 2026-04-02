@@ -64,9 +64,8 @@ static LogicalResult buildScanAddRegion(OpBuilder &builder, triton::ScanOp scan,
   block->addArgument(elemTy, loc);
   block->addArgument(elemTy, loc);
   builder.setInsertionPointToEnd(block);
-  Value sum =
-      createAddOp(builder, loc, block->getArgument(0), block->getArgument(1),
-                  elemTy);
+  Value sum = createAddOp(builder, loc, block->getArgument(0),
+                          block->getArgument(1), elemTy);
   if (!sum)
     return failure();
   builder.create<triton::ScanReturnOp>(loc, ValueRange{sum});
@@ -106,8 +105,7 @@ static LogicalResult buildReduceSelectByIndexRegion(OpBuilder &builder,
 }
 
 class LowerExclusiveCumsumPass
-    : public impl::TritonTleLowerExclusiveCumsumBase<
-          LowerExclusiveCumsumPass> {
+    : public impl::TritonTleLowerExclusiveCumsumBase<LowerExclusiveCumsumPass> {
   void runOnOperation() override {
     ModuleOp module = getOperation();
     SmallVector<tle::ExclusiveCumsumOp> ops;
@@ -129,7 +127,8 @@ class LowerExclusiveCumsumPass
         signalPassFailure();
         return;
       }
-      if (axisExtent > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+      if (axisExtent >
+          static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
         op.emitOpError("axis extent is too large for tt.make_range");
         signalPassFailure();
         return;
@@ -155,9 +154,8 @@ class LowerExclusiveCumsumPass
         return;
       }
 
-      RankedTensorType idxTy =
-          RankedTensorType::get(srcTy.getShape(), builder.getI32Type(),
-                                srcTy.getEncoding());
+      RankedTensorType idxTy = RankedTensorType::get(
+          srcTy.getShape(), builder.getI32Type(), srcTy.getEncoding());
       Value indices = builder
                           .create<triton::MakeRangeOp>(
                               op.getLoc(), idxTy, /*start=*/0u,
@@ -169,7 +167,8 @@ class LowerExclusiveCumsumPass
       bool pickMaxIndex = !op.getReverse();
       if (failed(buildReduceSelectByIndexRegion(builder, reduce, elemTy,
                                                 op.getLoc(), pickMaxIndex))) {
-        op.emitOpError("failed to build index-select combiner for triton.reduce");
+        op.emitOpError(
+            "failed to build index-select combiner for triton.reduce");
         signalPassFailure();
         return;
       }
