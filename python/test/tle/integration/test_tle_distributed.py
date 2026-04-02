@@ -310,6 +310,42 @@ def _remote_rank0_dsmem_scalar_ptr_atomic_add_kernel(out_ptr, mesh: tl.constexpr
 
 
 @triton.jit
+def _remote_rank0_dsmem_buffer_vs_ptr_remote_atomic_add_kernel(
+    out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr
+):
+    rank = tle.shard_id(mesh, "cluster_x")
+    zeros = tl.zeros((BLOCK, ), dtype=tl.int32)
+    ones = tl.full((BLOCK, ), 1, tl.int32)
+
+    smem = tle.gpu.alloc([2], dtype=tl.int32, layout=None, scope=tle.gpu.smem, nv_mma_shared_layout=False)
+    local_counter0_ptr = tle.gpu.local_ptr(smem, (0, ))
+    local_counter1_ptr = tle.gpu.local_ptr(smem, (1, ))
+
+    if rank == 0:
+        tl.store(local_counter0_ptr, 0)
+        tl.store(local_counter1_ptr, 0)
+    tle.distributed_barrier(mesh)
+
+    # Buffer-level remote + local_ptr path.
+    remote_rank0_buffer = tle.remote(smem, 0, scope=mesh)
+    remote_counter0_ptrs = tle.gpu.local_ptr(remote_rank0_buffer, (zeros, ))
+
+    # Pointer-level remote path with derived addptr tensor pointer.
+    remote_counter1_scalar_ptr = tle.remote(local_counter1_ptr, 0, scope=mesh)
+    remote_counter1_ptrs = remote_counter1_scalar_ptr + zeros
+
+    tl.atomic_add(remote_counter0_ptrs, ones, sem="relaxed", scope="cta")
+    tl.atomic_add(remote_counter1_ptrs, ones, sem="relaxed", scope="cta")
+    tle.distributed_barrier(mesh)
+
+    if rank == 0:
+        counter0 = tl.load(local_counter0_ptr)
+        counter1 = tl.load(local_counter1_ptr)
+        tl.store(out_ptr + 0, counter0)
+        tl.store(out_ptr + 1, counter1)
+
+
+@triton.jit
 def _remote_scan_shared_scratch_kernel(out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
     rank = tle.shard_id(mesh, "cluster_x")
     offs = tl.arange(0, BLOCK)
@@ -783,8 +819,7 @@ class TestTLEDistributed:
             num_warps=4,
         )
         assert compiled.metadata.cluster_dims == (2, 1, 1)
-        assert ("tle.remote_pointers" in compiled.asm["ttgir"]) or ("tle.remote_shard_id_carrier"
-                                                                    in compiled.asm["ttgir"])
+        assert "tle.remote_pointers" in compiled.asm["ttgir"]
         assert "\"ttg.num-ctas\" = 1" in compiled.asm["ttgir"]
         assert "mapa.shared::cluster" in compiled.asm["ptx"]
 
@@ -936,15 +971,16 @@ class TestTLEDistributed:
         ptx = compiled.asm["ptx"]
 
         # local/remote pointer tensors should keep the load-friendly encoding.
-        assert "tensor<256x!tt.ptr<f16, 3>, #blocked>" in ttgir
+        assert re.search(r"tensor<256x!tt\.ptr<f16,\s*3>,\s*#blocked[0-9]*>",
+                         ttgir) is not None
         assert re.search(
             r"\"tle\.remote_pointers\"\(%[^,]+,\s*%[^)]+\)\s*:\s*"
-            r"\(tensor<256x!tt\.ptr<f16,\s*3>,\s*#blocked>,\s*i32\)\s*->\s*"
-            r"tensor<256x!tt\.ptr<f16,\s*3>,\s*#blocked>",
+            r"\(tensor<256x!tt\.ptr<f16,\s*3>,\s*#blocked[0-9]*>,\s*i32\)\s*->\s*"
+            r"tensor<256x!tt\.ptr<f16,\s*7>,\s*#blocked[0-9]*>",
             ttgir,
         ) is not None
         # Avoid re-introducing a degraded blocked1 -> blocked convert path.
-        assert "ttg.convert_layout %remote_ptr : tensor<256x!tt.ptr<f16, 3>, #blocked1> -> tensor<256x!tt.ptr<f16, 3>, #blocked>" not in ttgir
+        assert "ttg.convert_layout %remote_ptr : tensor<256x!tt.ptr<f16, 7>, #blocked1> -> tensor<256x!tt.ptr<f16, 7>, #blocked>" not in ttgir
         assert "ld.shared::cluster.b16" in ptx
 
     def test_remote_const_shard_vectorized_load_lowering_same_cluster(self):
@@ -1188,6 +1224,50 @@ class TestTLEDistributed:
             )
             torch.cuda.synchronize()
             assert int(out.item()) == 8
+
+    def test_remote_rank0_dsmem_buffer_vs_ptr_remote_atomic_add_lowering_cluster8(self):
+        block = 128
+        out = torch.empty((2, ), device="cuda", dtype=torch.int32)
+        compiled = _remote_rank0_dsmem_buffer_vs_ptr_remote_atomic_add_kernel.warmup(
+            out,
+            mesh=BLOCK_CLUSTER_MESH_8,
+            BLOCK=block,
+            grid=(1, ),
+            num_ctas=1,
+            num_warps=4,
+        )
+        assert compiled.metadata.cluster_dims == (8, 1, 1)
+        ptx = compiled.asm["ptx"]
+        assert "atom.shared::cluster.cta.relaxed.add.u32" in ptx
+
+    @pytest.mark.parametrize("num_warps", [16, 32])
+    def test_remote_rank0_dsmem_buffer_vs_ptr_remote_atomic_add_runtime_cluster8_stable(self, num_warps):
+        block = num_warps * 32
+        expected = 8 * block
+        out = torch.empty((2, ), device="cuda", dtype=torch.int32)
+
+        compiled = _remote_rank0_dsmem_buffer_vs_ptr_remote_atomic_add_kernel.warmup(
+            out,
+            mesh=BLOCK_CLUSTER_MESH_8,
+            BLOCK=block,
+            grid=(1, ),
+            num_ctas=1,
+            num_warps=num_warps,
+        )
+        assert compiled.metadata.cluster_dims == (8, 1, 1)
+        assert "atom.shared::cluster.cta.relaxed.add.u32" in compiled.asm["ptx"]
+
+        for _ in range(128):
+            _remote_rank0_dsmem_buffer_vs_ptr_remote_atomic_add_kernel[(1, )](
+                out,
+                mesh=BLOCK_CLUSTER_MESH_8,
+                BLOCK=block,
+                num_ctas=1,
+                num_warps=num_warps,
+            )
+            torch.cuda.synchronize()
+            assert int(out[0].item()) == expected
+            assert int(out[1].item()) == expected
 
     def test_remote_scan_shared_scratch_compile_regression_cluster8(self):
         block = 64

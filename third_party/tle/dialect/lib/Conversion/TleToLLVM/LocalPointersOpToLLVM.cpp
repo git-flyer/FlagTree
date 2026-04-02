@@ -3,6 +3,7 @@
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMTypes.h"
+#include "mlir/Dialect/LLVMIR/NVVMDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "tle/dialect/include/IR/Dialect.h"
@@ -18,24 +19,23 @@ namespace {
 using namespace mlir;
 namespace ttg = mlir::triton::gpu;
 namespace tle = mlir::triton::tle;
-constexpr llvm::StringLiteral kRemoteShardCarrierAttr =
-    "tle.remote_shard_id_carrier";
-constexpr llvm::StringLiteral kTTContiguityAttr = "tt.contiguity";
-constexpr llvm::StringLiteral kTTDivisibilityAttr = "tt.divisibility";
-constexpr llvm::StringLiteral kTTConstancyAttr = "tt.constancy";
 
-void copyAxisInfoAttrs(Operation *src, Operation *dst) {
-  if (!src || !dst)
-    return;
-  auto tryCopy = [&](StringRef name) {
-    if (dst->getDiscardableAttr(name))
-      return;
-    if (auto attr = src->getDiscardableAttr(name))
-      dst->setDiscardableAttr(name, attr);
-  };
-  tryCopy(kTTContiguityAttr);
-  tryCopy(kTTDivisibilityAttr);
-  tryCopy(kTTConstancyAttr);
+Value mapSharedToClusterPointer(ConversionPatternRewriter &rewriter,
+                                Location loc, Value ptr, Value ctaId) {
+  auto ptrTy = dyn_cast<LLVM::LLVMPointerType>(ptr.getType());
+  if (!ptrTy)
+    return Value();
+  const unsigned sharedAddrSpace =
+      static_cast<unsigned>(NVVM::NVVMMemorySpace::Shared);
+  const unsigned clusterSharedAddrSpace =
+      static_cast<unsigned>(NVVM::NVVMMemorySpace::SharedCluster);
+  if (ptrTy.getAddressSpace() == clusterSharedAddrSpace)
+    return ptr;
+  if (ptrTy.getAddressSpace() != sharedAddrSpace)
+    return Value();
+  auto clusterPtrTy =
+      LLVM::LLVMPointerType::get(rewriter.getContext(), clusterSharedAddrSpace);
+  return NVVM::MapaOp::create(rewriter, loc, clusterPtrTy, ptr, ctaId);
 }
 
 struct LocalPointersOpConversion
@@ -280,29 +280,67 @@ private:
 };
 
 struct RemotePointersOpConversion
-    : public OpConversionPattern<tle::RemotePointersOp> {
-  using OpConversionPattern<tle::RemotePointersOp>::OpConversionPattern;
+    : public ConvertOpToLLVMPattern<tle::RemotePointersOp> {
+  RemotePointersOpConversion(LLVMTypeConverter &typeConverter,
+                             PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(typeConverter, benefit) {}
 
   LogicalResult
   matchAndRewrite(tle::RemotePointersOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    Value offset = op.getShardId();
-    if (auto srcTy = dyn_cast<RankedTensorType>(op.getSrc().getType())) {
-      auto shardTy = dyn_cast<RankedTensorType>(offset.getType());
-      if (!shardTy || shardTy.getShape() != srcTy.getShape() ||
-          shardTy.getEncoding() != srcTy.getEncoding()) {
-        auto offsetTy = RankedTensorType::get(
-            srcTy.getShape(), offset.getType(), srcTy.getEncoding());
-        offset =
-            rewriter.create<triton::SplatOp>(op.getLoc(), offsetTy, offset);
-      }
+    auto loc = op.getLoc();
+    auto *typeConverter = getTypeConverter();
+    auto reportFailure = [&](StringRef msg) -> LogicalResult {
+      llvm::errs() << "[RemotePointersOpConversion] " << msg << "\n";
+      return rewriter.notifyMatchFailure(op, msg);
+    };
+
+    auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    if (srcElems.empty())
+      return reportFailure("expected non-empty source pointer elements");
+
+    auto shardElems = unpackLLElements(loc, adaptor.getShardId(), rewriter);
+    if (shardElems.empty())
+      return reportFailure("expected non-empty shard_id elements");
+    if (shardElems.size() != 1 && shardElems.size() != srcElems.size())
+      return reportFailure(
+          "shard_id must be scalar or match source pointer element count");
+
+    auto ensureI32 = [&](Value v) -> Value {
+      if (!v)
+        return Value();
+      if (v.getType().isInteger(32))
+        return v;
+      auto intTy = dyn_cast<IntegerType>(v.getType());
+      if (!intTy)
+        return Value();
+      if (intTy.getWidth() > 32)
+        return rewriter.create<LLVM::TruncOp>(loc, rewriter.getI32Type(), v);
+      if (intTy.isUnsigned())
+        return rewriter.create<LLVM::ZExtOp>(loc, rewriter.getI32Type(), v);
+      return rewriter.create<LLVM::SExtOp>(loc, rewriter.getI32Type(), v);
+    };
+
+    SmallVector<Value> mappedPtrs;
+    mappedPtrs.reserve(srcElems.size());
+    for (auto [idx, srcPtr] : llvm::enumerate(srcElems)) {
+      if (!isa<LLVM::LLVMPointerType>(srcPtr.getType()))
+        return reportFailure("source elements must lower to LLVM pointers");
+      Value shardVal = shardElems.size() == 1 ? shardElems.front()
+                                              : shardElems[idx];
+      Value ctaId = ensureI32(shardVal);
+      if (!ctaId)
+        return reportFailure("shard_id must lower to i32 scalar elements");
+      Value mappedPtr = mapSharedToClusterPointer(rewriter, loc, srcPtr, ctaId);
+      if (!mappedPtr)
+        return reportFailure(
+            "source pointers must lower to shared/cluster-shared address space");
+      mappedPtrs.push_back(mappedPtr);
     }
-    auto addPtr = rewriter.create<triton::AddPtrOp>(op.getLoc(), op.getType(),
-                                                    op.getSrc(), offset);
-    addPtr->setAttr(kRemoteShardCarrierAttr, rewriter.getUnitAttr());
-    copyAxisInfoAttrs(op.getOperation(), addPtr.getOperation());
-    copyAxisInfoAttrs(op.getSrc().getDefiningOp(), addPtr.getOperation());
-    rewriter.replaceOp(op, addPtr.getResult());
+
+    Value packed = packLLElements(loc, typeConverter, mappedPtrs, rewriter,
+                                  op.getType());
+    rewriter.replaceOp(op, packed);
     return success();
   }
 };
@@ -313,6 +351,11 @@ void tle::populateLocalPointersOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
     RewritePatternSet &patterns, PatternBenefit benefit) {
   patterns.add<LocalPointersOpConversion>(typeConverter, targetInfo, benefit);
-  patterns.add<RemotePointersOpConversion>(typeConverter, patterns.getContext(),
-                                           benefit);
+}
+
+void tle::populateRemotePointersOpToLLVMPatterns(
+    LLVMTypeConverter &typeConverter, const TargetInfoBase &targetInfo,
+    RewritePatternSet &patterns, PatternBenefit benefit) {
+  (void)targetInfo;
+  patterns.add<RemotePointersOpConversion>(typeConverter, benefit);
 }

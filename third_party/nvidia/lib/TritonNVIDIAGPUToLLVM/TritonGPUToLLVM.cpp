@@ -78,6 +78,9 @@ public:
     addIllegalDialect<triton::gpu::TritonGPUDialect>();
     addIllegalDialect<triton::nvidia_gpu::TritonNvidiaGPUDialect>();
     addIllegalDialect<mlir::gpu::GPUDialect>();
+#ifdef __TLE__
+    addIllegalDialect<tle::TleDialect>();
+#endif
     addLegalOp<mlir::UnrealizedConversionCastOp>();
 
     // Warp specialization is lowered later.
@@ -106,6 +109,7 @@ public:
           }
           return hasLegalRegions && typeConverter.isLegal(op);
         });
+    addLegalOp<tle::RemotePointersOp>();
     // Allow non-TLE ops to remain during this partial conversion.
     markUnknownOpDynamicallyLegal([](Operation *) -> bool { return true; });
   }
@@ -200,6 +204,10 @@ struct ConvertTritonGPUToLLVM
     populateLoadStoreOpToLLVMPatterns(typeConverter, targetInfo,
                                       computeCapability, patterns,
                                       axisInfoAnalysis, benefit);
+#ifdef __TLE__
+    mlir::triton::tle::populateRemotePointersOpToLLVMPatterns(
+        typeConverter, targetInfo, patterns, benefit + 1);
+#endif
     mlir::triton::populateReduceOpToLLVMPatterns(typeConverter, patterns,
                                                  targetInfo, benefit);
     mlir::triton::populateScanOpToLLVMPatterns(typeConverter, patterns,

@@ -843,8 +843,20 @@ class SelectEncodingsPass
               continue;
             }
             if (auto remote = dyn_cast<triton::tle::RemotePointersOp>(owner)) {
-              if (remote.getResult().getType() != ptrTensorTy)
-                remote.getResult().setType(ptrTensorTy);
+              auto remoteResultTy =
+                  dyn_cast<RankedTensorType>(remote.getResult().getType());
+              if (!remoteResultTy)
+                continue;
+              auto remoteElemPtrTy =
+                  dyn_cast<triton::PointerType>(remoteResultTy.getElementType());
+              if (!remoteElemPtrTy)
+                continue;
+              auto desiredElemPtrTy = triton::PointerType::get(
+                  ptrElemTy, remoteElemPtrTy.getAddressSpace());
+              auto desiredRemoteTy = RankedTensorType::get(
+                  ptrTensorTy.getShape(), desiredElemPtrTy, ptrEncoding);
+              if (remoteResultTy != desiredRemoteTy)
+                remote.getResult().setType(desiredRemoteTy);
               self(self, remote.getResult());
               continue;
             }

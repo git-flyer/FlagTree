@@ -15,6 +15,8 @@ namespace mlir::triton::tle {
 namespace {
 // Triton shared-memory pointers map to LLVM address space 3 (NVVM shared).
 constexpr int kSharedMemoryAddressSpace = 3;
+// Cluster-shared pointers map to LLVM address space 7 (NVVM shared::cluster).
+constexpr int kClusterSharedMemoryAddressSpace = 7;
 } // namespace
 
 // ============================================================================
@@ -536,24 +538,66 @@ LogicalResult DistributedBarrierOp::verify() {
 LogicalResult RemotePointersOp::verify() {
   Type srcTy = getSrc().getType();
   Type resultTy = getResult().getType();
-  if (srcTy != resultTy)
-    return emitOpError() << "expects result type to match src type";
-
-  triton::PointerType ptrTy;
-  if (auto srcTensorTy = dyn_cast<RankedTensorType>(srcTy)) {
-    ptrTy = dyn_cast<triton::PointerType>(srcTensorTy.getElementType());
-    if (!ptrTy)
-      return emitOpError() << "expects tensor src/result element type to be "
-                              "tt.ptr";
-  } else if (auto srcPtrTy = dyn_cast<triton::PointerType>(srcTy)) {
-    ptrTy = srcPtrTy;
-  } else {
+  auto getPtrInfo =
+      [&](Type ty, triton::PointerType &ptr, bool &isTensor,
+          ArrayRef<int64_t> &shape, Attribute &encoding) -> LogicalResult {
+    if (auto tensorTy = dyn_cast<RankedTensorType>(ty)) {
+      ptr = dyn_cast<triton::PointerType>(tensorTy.getElementType());
+      if (!ptr)
+        return emitOpError()
+               << "expects tensor src/result element type to be tt.ptr";
+      isTensor = true;
+      shape = tensorTy.getShape();
+      encoding = tensorTy.getEncoding();
+      return success();
+    }
+    if (auto ptrTy = dyn_cast<triton::PointerType>(ty)) {
+      ptr = ptrTy;
+      isTensor = false;
+      shape = ArrayRef<int64_t>();
+      encoding = Attribute();
+      return success();
+    }
     return emitOpError() << "expects src/result to be tensor<tt.ptr<...>> or "
                             "tt.ptr";
-  }
+  };
 
-  if (ptrTy.getAddressSpace() != kSharedMemoryAddressSpace)
-    return emitOpError() << "expects pointers to live in shared memory";
+  triton::PointerType srcPtrTy;
+  triton::PointerType resultPtrTy;
+  bool srcIsTensor = false;
+  bool resultIsTensor = false;
+  ArrayRef<int64_t> srcShape;
+  ArrayRef<int64_t> resultShape;
+  Attribute srcEncoding;
+  Attribute resultEncoding;
+  if (failed(
+          getPtrInfo(srcTy, srcPtrTy, srcIsTensor, srcShape, srcEncoding)) ||
+      failed(getPtrInfo(resultTy, resultPtrTy, resultIsTensor, resultShape,
+                        resultEncoding)))
+    return failure();
+
+  if (srcIsTensor != resultIsTensor)
+    return emitOpError() << "expects src/result to both be scalar pointers or "
+                            "both be pointer tensors";
+  if (srcIsTensor) {
+    if (srcShape != resultShape)
+      return emitOpError() << "expects src/result pointer tensor shapes to "
+                              "match";
+    if (srcEncoding && resultEncoding && srcEncoding != resultEncoding)
+      return emitOpError() << "expects src/result pointer tensor encodings to "
+                              "match";
+  }
+  if (srcPtrTy.getPointeeType() != resultPtrTy.getPointeeType())
+    return emitOpError() << "expects src/result pointer pointee types to "
+                            "match";
+
+  if (srcPtrTy.getAddressSpace() != kSharedMemoryAddressSpace)
+    return emitOpError()
+           << "expects src pointers to live in shared memory (addrspace=3)";
+  if (resultPtrTy.getAddressSpace() != kClusterSharedMemoryAddressSpace)
+    return emitOpError()
+           << "expects result pointers to live in cluster shared memory "
+              "(addrspace=7)";
 
   if (!getShardId().getType().isInteger(32))
     return emitOpError() << "expects shard_id to be i32";

@@ -680,18 +680,27 @@ def _create_remote_pointers_tensor(
     tensor: tl.tensor,
     shard_id_tensor: tl.tensor,
     _semantic,
-) -> tl.tensor | None:
+) -> tl.tensor:
     builder = _semantic.builder
-    remote_type = tensor.type.to_ir(builder)
-    try:
-        remote_op = builder.create_remote_pointers(
-            remote_type,
-            tensor.handle,
-            shard_id_tensor.handle,
+    if not tensor.dtype.is_ptr():
+        raise TypeError("remote(pointer, ...) requires a pointer tensor input")
+    if not hasattr(builder, "create_remote_pointers"):
+        raise RuntimeError(
+            "remote pointer lowering requires TLE remote_pointers support in the active Triton build"
         )
-    except AttributeError:
-        return None
-    return tl.tensor(remote_op.get_result(0), tensor.type)
+    remote_ptr_dtype = tl.pointer_type(tensor.dtype.element_ty, 7)
+    if tensor.type.is_block():
+        remote_type = tl.block_type(remote_ptr_dtype, list(tensor.shape)).to_ir(builder)
+    else:
+        remote_type = remote_ptr_dtype.to_ir(builder)
+    remote_op = builder.create_remote_pointers(
+        remote_type,
+        tensor.handle,
+        shard_id_tensor.handle,
+    )
+    if tensor.type.is_block():
+        return tl.tensor(remote_op.get_result(0), tl.block_type(remote_ptr_dtype, list(tensor.shape)))
+    return tl.tensor(remote_op.get_result(0), remote_ptr_dtype)
 
 
 def _remote_pointer(
@@ -704,42 +713,33 @@ def _remote_pointer(
         raise TypeError(f"tensor must be tl.tensor, got {type(tensor).__name__}")
     if not tensor.dtype.is_ptr():
         raise TypeError("remote(pointer, ...) internal path requires a pointer tensor")
+    if tensor.dtype.address_space == 7:
+        # Pointer is already in cluster-shared space. Preserve compatibility
+        # for existing callsites that re-annotate with shard_id=0.
+        if isinstance(shard_id, (int, tuple, list)):
+            linear_shard_id = _normalize_compile_time_remote_shard_id(shard_id, scope)
+            if linear_shard_id == 0:
+                return tensor
+            raise ValueError("remote(pointer, ...) on cluster-shared pointers only supports shard_id=0")
+        raise ValueError("remote(pointer, ...) on cluster-shared pointers requires compile-time shard_id=0")
+
     if tensor.dtype.address_space != 3:
-        raise ValueError("remote(pointer, ...) internal path requires shared-memory pointers (addrspace=3)")
+        raise ValueError("remote(pointer, ...) internal path requires shared-memory pointers (addrspace=3) "
+                         "or cluster-shared pointers (addrspace=7)")
 
     # Compile-time constant shard id path.
     if isinstance(shard_id, (int, tuple, list)):
         linear_shard_id = _normalize_compile_time_remote_shard_id(shard_id, scope)
-        # Prefer explicit remote_pointers op so remote metadata survives
-        # downstream layout/materialization rewrites.
         shard_id_tensor = _semantic.to_tensor(int(linear_shard_id))
         shard_id_tensor = _normalize_runtime_remote_shard_id_tensor(shard_id_tensor)
-        remote_ptr = _create_remote_pointers_tensor(tensor, shard_id_tensor, _semantic)
-        if remote_ptr is not None:
-            return remote_ptr
-
-        # Compatibility fallback for older TLE extensions.
-        tensor.handle.set_attr("tle.remote_cta_id", _semantic.builder.get_int32_attr(int(linear_shard_id)))
-        return tensor
+        return _create_remote_pointers_tensor(tensor, shard_id_tensor, _semantic)
 
     # Runtime shard id path. This materializes a TLE op that carries the
     # runtime i32 shard id through lowering.
     shard_id_tensor = shard_id if isinstance(shard_id, tl.tensor) else _semantic.to_tensor(shard_id)
     shard_id_tensor = _normalize_runtime_remote_shard_id_tensor(shard_id_tensor)
 
-    # Preferred path: keep remote semantics through a dedicated TLE op so the
-    # shard-id survives local_pointers lowering.
-    remote_ptr = _create_remote_pointers_tensor(tensor, shard_id_tensor, _semantic)
-    if remote_ptr is not None:
-        return remote_ptr
-
-    # Compatibility fallback for older TLE extensions.
-    # Represent runtime shard_id with a marked addptr op. The lowering rewrites
-    # pointer arithmetic to use the original base pointer and consumes the
-    # runtime i32 from addptr's offset operand as cluster CTA id.
-    remote_ptr = _semantic.add(tensor, shard_id_tensor, sanitize_overflow=True)
-    remote_ptr.handle.set_attr("tle.remote_shard_id_carrier", _semantic.builder.get_unit_attr())
-    return remote_ptr
+    return _create_remote_pointers_tensor(tensor, shard_id_tensor, _semantic)
 
 
 @tl.builtin
