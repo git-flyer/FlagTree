@@ -1,5 +1,9 @@
 name: PR Labeler
 
+# pull_request_target is used so that the workflow runs with write permissions
+# even on PRs from forks, allowing labels to be applied.
+# This is safe here because no code from the PR is checked out or executed;
+# the labeler only reads the list of changed file paths.
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
