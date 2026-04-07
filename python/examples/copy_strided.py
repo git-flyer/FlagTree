@@ -2,7 +2,7 @@ import triton
 import triton.language as tl
 import triton.compiler as tc
 
-
+#sdadad
 # triton kernel
 @triton.jit
 def kernel(X, stride_xm,  #
