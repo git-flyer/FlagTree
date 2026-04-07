@@ -3794,7 +3794,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
 
     elif provider == "trtllm-decode":
         if _load_embedded_trtllm_indexer_topk() is None:
-            raise RuntimeError("TRT-LLM indexerTopK extension unavailable")
+            return float("nan"), float("nan"), float("nan")
         trtllm_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
         trtllm_out_logits_aux = torch.empty((batch, 10 * topk), dtype=torch.float32, device=x.device)
         trtllm_out_indices_aux = torch.empty((batch, 10 * topk), dtype=torch.int32, device=x.device)
@@ -3812,7 +3812,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
 
     elif provider == "trtllm-prefill":
         if _load_embedded_trtllm_indexer_topk() is None:
-            raise RuntimeError("TRT-LLM indexerTopK extension unavailable")
+            return float("nan"), float("nan"), float("nan")
         trtllm_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
 
         def run():
@@ -3826,7 +3826,7 @@ def benchmark(batch, seq_len, topk, provider, block_size, warmup, rep):
 
     elif provider == "trtllm-prefill-1024threads":
         if _load_embedded_trtllm_indexer_topk(prefill_threads=1024) is None:
-            raise RuntimeError("TRT-LLM indexerTopK extension unavailable")
+            return float("nan"), float("nan"), float("nan")
         trtllm_out = torch.full((batch, topk), -1, dtype=torch.int32, device=x.device)
 
         def run():
