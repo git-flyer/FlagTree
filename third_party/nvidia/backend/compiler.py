@@ -405,6 +405,9 @@ class CUDABackend(BaseBackend):
             passes.ttgpuir.add_concurrency_sanitizer(pm)
         passes.ttgpuir.add_allocate_global_scratch_memory(pm)
         nvidia.passes.ttnvgpuir.add_proxy_fence_insertion(pm, capability)
+        # Inline TLE DSL regions before TritonGPU->LLVM lowering so no
+        # `tle.dsl_region` op survives into the conversion pipeline.
+        tle.raw_passes.add_tle_dsl_region_inline(pm)
         # instrumentation point here so we can override IRs above (e.g., ttir and ttgir)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
@@ -423,8 +426,6 @@ class CUDABackend(BaseBackend):
 
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("llvmir_to_llvm", pm, mod.context)
-        # flagtree tle raw
-        tle.raw_passes.add_tle_dsl_region_inline(pm)
 
         pm.run(mod, 'make_llir')
 
