@@ -64,7 +64,7 @@ ascend:
 tle/dsa:
   - changed-files:
       - any-glob-to-any-file:
-          - 'third_party/tle\/dsa/**'
+          - 'third_party/tle/dsa/**'
 
 
 
