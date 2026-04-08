@@ -56,6 +56,17 @@ proton:
       - any-glob-to-any-file:
           - 'third_party/proton/**'
 
+ascend:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'third_party/ascend/**'
+
+tle/dsa:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'third_party/tle\/dsa/**'
+
+
 
 # ---- DOC label ----
 # This label is applied ONLY when the PR consists exclusively of documentation.
